@@ -1,0 +1,4 @@
+.env
+ppo/__pycache__
+ppo/videos
+ppo/wandb
