@@ -30,7 +30,8 @@ warnings.filterwarnings("ignore")
 # %%
 
 from utils import set_global_seeds
-from probes import Probe1, Probe2, Probe3, Probe4, Probe5, get_episode_data_from_infos
+from environments.probes import Probe1, Probe2, Probe3, Probe4, Probe5, get_episode_data_from_infos
+from environments.mappo_test import MappoTest
 from utils import prepare_atari_env
 from utils import arg_help, make_env
 from plotly_utils import plot_cartpole_obs_and_dones
@@ -152,13 +153,20 @@ def get_actor_and_critic(
     """
     assert mode in ["classic-control", "atari", "mujoco", "mappo-test", "soccer"]
 
-    obs_shape = envs.single_observation_space.shape
+    obs_global_shape = envs.single_observation_space.shape
+    if mode == "mappo-test" or mode == "soccer":
+        num_agents = obs_global_shape[0]
+        obs_shape = obs_global_shape[1:]
+    else:
+        num_agents = 1
+        obs_shape = obs_global_shape
     num_obs = np.array(obs_shape).prod()
-    num_actions = (
-        envs.single_action_space.n
-        if isinstance(envs.single_action_space, gym.spaces.Discrete)
-        else np.array(envs.single_action_space.shape).prod()
-    )
+    if isinstance(envs.single_action_space, gym.spaces.Discrete):
+        num_actions = envs.single_action_space.n
+    elif isinstance(envs.single_action_space, gym.spaces.MultiDiscrete):
+        num_actions = np.array(envs.single_action_space.nvec)[0]
+    else:
+        num_actions = np.array(envs.single_action_space.shape).prod()
 
     # TODO: implement get_actor_and_critic_soccer and mappo-test
     if mode == "classic-control":
@@ -168,13 +176,32 @@ def get_actor_and_critic(
     if mode == "mujoco":
         actor, critic = get_actor_and_critic_mujoco(num_obs, num_actions)  # you'll implement these later
     if mode == "mappo-test":
-        actor, critic = get_actor_and_critic_mappo_test(num_obs, num_actions)  # you'll implement these later
+        actor, critic = get_actor_and_critic_mappo_test(num_obs, num_actions, num_agents)  # you'll implement these later
     if mode == "soccer":
-        actor, critic = get_actor_and_critic_soccer(num_obs, num_actions)  # you'll implement these later
+        actor, critic = get_actor_and_critic_soccer(num_obs, num_actions, num_agents)  # you'll implement these later
 
     return actor.to(device), critic.to(device)
 
-def get_ovs_for_agent_standart(global_obs: Arr, agent_idx: int) -> Arr:
+
+def get_actor_and_critic_mappo_test(num_obs: int, num_actions: int, num_agents: int):
+    actor = nn.Sequential(
+        layer_init(nn.Linear(num_obs, 64)),
+        nn.Tanh(),
+        layer_init(nn.Linear(64, 64)),
+        nn.Tanh(),
+        layer_init(nn.Linear(64, num_actions), std=0.01),
+    )
+    critic = nn.Sequential(
+        nn.Flatten(),
+        layer_init(nn.Linear(num_agents * num_obs, 64)),
+        nn.Tanh(),
+        layer_init(nn.Linear(64, 64)),
+        nn.Tanh(),
+        layer_init(nn.Linear(64, 1), std=1.0),
+    )
+    return actor, critic
+
+"""def get_ovs_for_agent_standart(global_obs: Arr, agent_idx: int) -> Arr:
     return global_obs
 
 def get_obs_for_agent_function(mode):
@@ -183,7 +210,7 @@ def get_obs_for_agent_function(mode):
     if mode == "mappo-test":
         return get_ovs_for_agent_mappo_test
     if mode == "soccer":
-        return get_ovs_for_agent_soccer
+        return get_ovs_for_agent_soccer"""
 
 # TODO: Do I need this?
 def get_actor_and_critic_classic(num_obs: int, num_actions: int):
@@ -261,6 +288,7 @@ class ReplayMinibatch:
     """
 
     obs: Float[Tensor, "minibatch_size *obs_shape"]
+    obs_global: Float[Tensor, "minibatch_size *obs_global_shape"]
     actions: Int[Tensor, "minibatch_size *action_shape"]
     logprobs: Float[Tensor, "minibatch_size"]
     advantages: Float[Tensor, "minibatch_size"]
@@ -275,6 +303,7 @@ class ReplayMemory:
 
     rng: Generator
     obs: Float[Arr, "buffer_size num_envs *obs_shape"]
+    obs_global: Float[Arr, "buffer_size num_envs *obs_global_shape"]
     actions: Int[Arr, "buffer_size num_envs *action_shape"]
     logprobs: Float[Arr, "buffer_size num_envs"]
     values: Float[Arr, "buffer_size num_envs"]
@@ -285,6 +314,7 @@ class ReplayMemory:
         self,
         num_envs: int,
         obs_shape: tuple,
+        obs_global_shape: tuple,
         action_shape: tuple,
         batch_size: int,
         minibatch_size: int,
@@ -293,6 +323,7 @@ class ReplayMemory:
     ):
         self.num_envs = num_envs
         self.obs_shape = obs_shape
+        self.obs_global_shape = obs_global_shape
         self.action_shape = action_shape
         self.batch_size = batch_size
         self.minibatch_size = minibatch_size
@@ -303,6 +334,7 @@ class ReplayMemory:
     def reset(self):
         """Resets all stored experiences, ready for new ones to be added to memory."""
         self.obs = np.empty((0, self.num_envs, *self.obs_shape), dtype=np.float32)
+        self.obs_global = np.empty((0, self.num_envs, *self.obs_global_shape), dtype=np.float32)
         self.actions = np.empty((0, self.num_envs, *self.action_shape), dtype=np.int32)
         self.logprobs = np.empty((0, self.num_envs), dtype=np.float32)
         self.values = np.empty((0, self.num_envs), dtype=np.float32)
@@ -312,6 +344,7 @@ class ReplayMemory:
     def add(
         self,
         obs: Float[Arr, "num_envs *obs_shape"],
+        obs_global: Float[Arr, "num_envs *obs_shape"],
         actions: Int[Arr, "num_envs *action_shape"],
         logprobs: Float[Arr, "num_envs"],
         values: Float[Arr, "num_envs"],
@@ -321,13 +354,14 @@ class ReplayMemory:
         """Add a batch of transitions to the replay memory."""
         # Check shapes & datatypes
         for data, expected_shape in zip(
-            [obs, actions, logprobs, values, rewards, terminated], [self.obs_shape, self.action_shape, (), (), (), ()]
+            [obs, obs_global, actions, logprobs, values, rewards, terminated], [self.obs_shape, self.obs_global_shape, self.action_shape, (), (), (), ()]
         ):
             assert isinstance(data, np.ndarray)
             assert data.shape == (self.num_envs, *expected_shape)
 
         # Add data to buffer (not slicing off old elements)
         self.obs = np.concatenate((self.obs, obs[None, :]))
+        self.obs_global = np.concatenate((self.obs_global, obs_global[None, :]))
         self.actions = np.concatenate((self.actions, actions[None, :]))
         self.logprobs = np.concatenate((self.logprobs, logprobs[None, :]))
         self.values = np.concatenate((self.values, values[None, :]))
@@ -342,9 +376,9 @@ class ReplayMemory:
         `batches_per_learning_phase` copies of the entire replay memory.
         """
         # Convert everything to tensors on the correct device
-        obs, actions, logprobs, values, rewards, terminated = (
+        obs, obs_global, actions, logprobs, values, rewards, terminated = (
             t.tensor(x, device=device)
-            for x in [self.obs, self.actions, self.logprobs, self.values, self.rewards, self.terminated]
+            for x in [self.obs, self.obs_global, self.actions, self.logprobs, self.values, self.rewards, self.terminated]
         )
 
         # Compute advantages & returns
@@ -359,7 +393,7 @@ class ReplayMemory:
                     ReplayMinibatch(
                         *[
                             data.flatten(0, 1)[indices]
-                            for data in [obs, actions, logprobs, advantages, returns, terminated]
+                            for data in [obs, obs_global, actions, logprobs, advantages, returns, terminated]
                         ]
                     )
                 )
@@ -368,8 +402,8 @@ class ReplayMemory:
         self.reset()
 
         return minibatches
-
-# %%
+    
+"""
 if MAIN:
     num_steps_per_rollout = 128
     num_envs = 2
@@ -409,21 +443,21 @@ if MAIN:
         minibatches[0].terminated.cpu(),
         title="Current obs (sampled)<br>this is what gets fed into our model for training",
     )
-
+"""
 
 # %%
 class PPOAgents:
     critic: nn.Sequential
     actor: nn.Sequential
 
-    def __init__(self, envs: gym.vector.SyncVectorEnv, actor: nn.Module, critic: nn.Module, memory: ReplayMemory, num_agents: int, get_obs_for_agent: Callable):
+    def __init__(self, envs: gym.vector.SyncVectorEnv, actor: nn.Module, critic: nn.Module, memory: ReplayMemory, num_agents: int):
         super().__init__()
         self.envs = envs
         self.actor = actor
         self.critic = critic
         self.memory = memory
         self.num_agents = num_agents
-        self.get_obs_for_agent = get_obs_for_agent
+        # self.get_obs_for_agent = get_obs_for_agent
 
         self.step = 0  # Tracking number of steps taken (across all environments)
         self.next_obs = t.tensor(envs.reset()[0], device=device, dtype=t.float)  # need starting obs (in tensor form)
@@ -437,21 +471,22 @@ class PPOAgents:
         """
         # Get newest observations (i.e. where we're starting from)
         obs_global = self.next_obs
+        if self.num_agents == 1:
+            obs_global = obs_global[:, None]
         terminated = self.next_terminated
 
         # Compute logits based on newest observation, and use it to get an action distribution we sample from
         # TODO: add multiple agents, sample the action of each of them
         agent_actions = []
-        agent_obs = []
         agent_dists = []
         for agent_idx in range(self.num_agents):
-            obs = self.get_obs_for_agent(obs_global, agent_idx)
+            # obs = self.get_obs_for_agent(obs_global, agent_idx)
+            obs = obs_global[:, agent_idx]
             with t.inference_mode():
                 logits = self.actor(obs)
             dist = Categorical(logits=logits)
             actions = dist.sample()
             agent_actions.append(actions)
-            agent_obs.append(obs)
             agent_dists.append(dist)
         agent_actions = t.stack(agent_actions, axis=1)
 
@@ -464,10 +499,10 @@ class PPOAgents:
         # Add to memory for each agent (obs, action, logprob seperately) (values, rewards, terminated together)
         for agent_idx in range(self.num_agents):
             actions = agent_actions[:, agent_idx]
-            obs_vector = agent_obs[agent_idx]
+            obs = obs_global[:, agent_idx]
             dist = agent_dists[agent_idx]
             logprobs = dist.log_prob(actions).cpu().numpy()
-            self.memory.add(obs_vector.cpu().numpy(), actions.cpu().numpy(), logprobs, values, rewards, terminated.cpu().numpy())
+            self.memory.add(obs.cpu().numpy(), obs_global.squeeze(dim=1).cpu().numpy(), actions.cpu().numpy(), logprobs, values, rewards, terminated.cpu().numpy())
 
         # Set next observation & termination state
         self.next_obs = t.from_numpy(next_obs_global).to(device, dtype=t.float)
@@ -596,12 +631,19 @@ class PPOTrainer:
         # Define some basic variables from our environment
         self.num_envs = self.envs.num_envs
         self.action_shape = self.envs.single_action_space.shape
-        self.obs_shape = self.envs.single_observation_space.shape
+        if self.args.num_agents > 1:
+            self.action_shape = self.action_shape[1:]
+        self.obs_global_shape = self.envs.single_observation_space.shape
+        if self.args.num_agents > 1:
+            self.obs_shape = self.obs_global_shape[1:]
+        else:
+            self.obs_shape = self.obs_global_shape
 
         # Create our replay memory
         self.memory = ReplayMemory(
             self.num_envs,
             self.obs_shape,
+            self.obs_global_shape,
             self.action_shape,
             args.batch_size,
             args.minibatch_size,
@@ -614,10 +656,10 @@ class PPOTrainer:
         self.optimizer, self.scheduler = make_optimizer(self.actor, self.critic, args.total_training_steps, args.lr)
 
         # get the get_obs_for_agent function
-        get_obs_for_agent = get_obs_for_agent_function(mode=args.mode)
+        # get_obs_for_agent = get_obs_for_agent_function(mode=args.mode)
 
         # Create our agent
-        self.agents = PPOAgents(self.envs, self.actor, self.critic, self.memory, self.args.num_agents, get_obs_for_agent)
+        self.agents = PPOAgents(self.envs, self.actor, self.critic, self.memory, self.args.num_agents)
 
     def rollout_phase(self) -> dict | None:
         """
@@ -670,7 +712,7 @@ class PPOTrainer:
         """
         logits = self.actor(minibatch.obs)
         dist = Categorical(logits=logits)
-        values = self.critic(minibatch.obs).squeeze()
+        values = self.critic(minibatch.obs_global).squeeze()
 
         clipped_surrogate_objective = calc_clipped_surrogate_objective(
             dist, minibatch.actions, minibatch.advantages, minibatch.logprobs, self.args.clip_coef
@@ -764,12 +806,21 @@ def test_probe(probe_idx: int):
         t.testing.assert_close(probs, t.tensor(expected_probs).to(device), atol=tolerances[probe_idx - 1], rtol=0)
     print("Probe tests passed!\n")
 
+# %%
+# if MAIN:
+#     for probe_idx in range(1, 6):
+#         test_probe(probe_idx)
+
 
 # %%
 if MAIN:
-    for probe_idx in range(1, 6):
-        test_probe(probe_idx)
-
+    gym.envs.registration.register(id="MappoTest-v0", entry_point=MappoTest)
+    env = gym.make("MappoTest-v0")
+    assert env.observation_space.shape == (2, 4)
+    assert env.action_space.shape == (2,)
+    args = PPOArgs(env_id="MappoTest-v0", mode="mappo-test", num_agents=2, total_timesteps=100_000, use_wandb=True, gamma=0.0)
+    trainer = PPOTrainer(args)
+    trainer.train()
 
 # %%
 if MAIN:
@@ -822,7 +873,6 @@ class SpinCart(CartPoleEnv):
         reward_new = rotation_speed_reward - 0.5 * stability_penalty
 
         return (obs, reward_new, terminated, truncated, info)
-
 
 if MAIN:
     gym.envs.registration.register(id="SpinCart-v0", entry_point=SpinCart, max_episode_steps=500)
