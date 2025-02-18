@@ -6,7 +6,7 @@ import time
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Callable
 
 import einops
 import gymnasium as gym
@@ -45,8 +45,10 @@ directory = Path(__file__).parent
 
 device = t.device("mps" if t.backends.mps.is_available() else "cuda" if t.cuda.is_available() else "cpu")
 
-MAIN = __name__ == "__main__"
+is_debugging = sys.gettrace() is not None
+MAIN = __name__ == "__main__" or is_debugging
 
+MODES = ["classic-control", "atari", "mujoco", "mappo-test", "soccer"]
 
 # %%
 @dataclass
@@ -54,7 +56,7 @@ class PPOArgs:
     # Basic / global
     seed: int = 1
     env_id: str = "CartPole-v1"
-    mode: Literal["classic-control", "atari", "mujoco"] = "classic-control"
+    mode: Literal["classic-control", "atari", "mujoco", "mappo-test", "soccer"] = "classic-control"
 
     # Wandb / logging
     use_wandb: bool = False
@@ -82,6 +84,9 @@ class PPOArgs:
     ent_coef: float = 0.01
     vf_coef: float = 0.25
 
+    # multi-agent specific
+    num_agents: int = 1
+
     def __post_init__(self):
         self.batch_size = self.num_steps_per_rollout * self.num_envs
 
@@ -96,7 +101,7 @@ class PPOArgs:
 ARG_HELP_STRINGS = dict(
     seed="seed of the experiment",
     env_id="the id of the environment",
-    mode="can be 'classic-control', 'atari' or 'mujoco'",
+    mode="can be 'classic-control', 'atari', 'mujoco', 'mappo-test' or 'soccer'",
     #
     use_wandb="if toggled, this experiment will be tracked with Weights and Biases",
     video_log_freq="if not None, we log videos this many episodes apart (so shorter episodes mean more frequent logging)",
@@ -122,6 +127,8 @@ ARG_HELP_STRINGS = dict(
     minibatch_size="the size of a single minibatch we perform a gradient step on (calculated from other values in PPOArgs)",
     total_phases="total number of phases during training (calculated from other values in PPOArgs)",
     total_training_steps="total number of minibatches we will perform an update step on during training (calculated from other values in PPOArgs)",
+    #
+    num_agents="number of agents in the multi-agent case",
 )
 
 
@@ -138,12 +145,12 @@ def layer_init(layer: nn.Linear, std=np.sqrt(2), bias_const=0.0):
 
 def get_actor_and_critic(
     envs: gym.vector.SyncVectorEnv,
-    mode: Literal["classic-control", "atari", "mujoco"] = "classic-control",
+    mode: Literal["classic-control", "atari", "mujoco", "mappo-test", "soccer"] = "classic-control",
 ) -> tuple[nn.Module, nn.Module]:
     """
     Returns (actor, critic), the networks used for PPO, in one of 3 different modes.
     """
-    assert mode in ["classic-control", "atari", "mujoco"]
+    assert mode in ["classic-control", "atari", "mujoco", "mappo-test", "soccer"]
 
     obs_shape = envs.single_observation_space.shape
     num_obs = np.array(obs_shape).prod()
@@ -153,16 +160,30 @@ def get_actor_and_critic(
         else np.array(envs.single_action_space.shape).prod()
     )
 
-    # TODO: implement get_actor_and_critic_soccer
+    # TODO: implement get_actor_and_critic_soccer and mappo-test
     if mode == "classic-control":
         actor, critic = get_actor_and_critic_classic(num_obs, num_actions)
     if mode == "atari":
         actor, critic = get_actor_and_critic_atari(obs_shape, num_actions)  # you'll implement these later
     if mode == "mujoco":
         actor, critic = get_actor_and_critic_mujoco(num_obs, num_actions)  # you'll implement these later
+    if mode == "mappo-test":
+        actor, critic = get_actor_and_critic_mappo_test(num_obs, num_actions)  # you'll implement these later
+    if mode == "soccer":
+        actor, critic = get_actor_and_critic_soccer(num_obs, num_actions)  # you'll implement these later
 
     return actor.to(device), critic.to(device)
 
+def get_ovs_for_agent_standart(global_obs: Arr, agent_idx: int) -> Arr:
+    return global_obs
+
+def get_obs_for_agent_function(mode):
+    if mode == "classic-control" or mode == "atari" or mode == "mujoco":
+        return get_ovs_for_agent_standart
+    if mode == "mappo-test":
+        return get_ovs_for_agent_mappo_test
+    if mode == "soccer":
+        return get_ovs_for_agent_soccer
 
 # TODO: Do I need this?
 def get_actor_and_critic_classic(num_obs: int, num_actions: int):
@@ -391,16 +412,18 @@ if MAIN:
 
 
 # %%
-class PPOAgent:
+class PPOAgents:
     critic: nn.Sequential
     actor: nn.Sequential
 
-    def __init__(self, envs: gym.vector.SyncVectorEnv, actor: nn.Module, critic: nn.Module, memory: ReplayMemory):
+    def __init__(self, envs: gym.vector.SyncVectorEnv, actor: nn.Module, critic: nn.Module, memory: ReplayMemory, num_agents: int, get_obs_for_agent: Callable):
         super().__init__()
         self.envs = envs
         self.actor = actor
         self.critic = critic
         self.memory = memory
+        self.num_agents = num_agents
+        self.get_obs_for_agent = get_obs_for_agent
 
         self.step = 0  # Tracking number of steps taken (across all environments)
         self.next_obs = t.tensor(envs.reset()[0], device=device, dtype=t.float)  # need starting obs (in tensor form)
@@ -413,29 +436,44 @@ class PPOAgent:
         Returns the list of info dicts returned from `self.envs.step`.
         """
         # Get newest observations (i.e. where we're starting from)
-        obs = self.next_obs
+        obs_global = self.next_obs
         terminated = self.next_terminated
 
         # Compute logits based on newest observation, and use it to get an action distribution we sample from
-        with t.inference_mode():
-            logits = self.actor(obs)
-        dist = Categorical(logits=logits)
-        actions = dist.sample()
+        # TODO: add multiple agents, sample the action of each of them
+        agent_actions = []
+        agent_obs = []
+        agent_dists = []
+        for agent_idx in range(self.num_agents):
+            obs = self.get_obs_for_agent(obs_global, agent_idx)
+            with t.inference_mode():
+                logits = self.actor(obs)
+            dist = Categorical(logits=logits)
+            actions = dist.sample()
+            agent_actions.append(actions)
+            agent_obs.append(obs)
+            agent_dists.append(dist)
+        agent_actions = t.stack(agent_actions, axis=1)
 
         # Step environment based on the sampled action
-        next_obs, rewards, next_terminated, next_truncated, infos = self.envs.step(actions.cpu().numpy())
+        next_obs_global, rewards, next_terminated, next_truncated, infos = self.envs.step(agent_actions.cpu().numpy().squeeze())
 
         # Calculate logprobs and values, and add this all to replay memory
-        logprobs = dist.log_prob(actions).cpu().numpy()
         with t.inference_mode():
-            values = self.critic(obs).flatten().cpu().numpy()
-        self.memory.add(obs.cpu().numpy(), actions.cpu().numpy(), logprobs, values, rewards, terminated.cpu().numpy())
+            values = self.critic(obs_global).flatten().cpu().numpy()
+        # Add to memory for each agent (obs, action, logprob seperately) (values, rewards, terminated together)
+        for agent_idx in range(self.num_agents):
+            actions = agent_actions[:, agent_idx]
+            obs_vector = agent_obs[agent_idx]
+            dist = agent_dists[agent_idx]
+            logprobs = dist.log_prob(actions).cpu().numpy()
+            self.memory.add(obs_vector.cpu().numpy(), actions.cpu().numpy(), logprobs, values, rewards, terminated.cpu().numpy())
 
         # Set next observation & termination state
-        self.next_obs = t.from_numpy(next_obs).to(device, dtype=t.float)
+        self.next_obs = t.from_numpy(next_obs_global).to(device, dtype=t.float)
         self.next_terminated = t.from_numpy(next_terminated).to(device, dtype=t.float)
 
-        self.step += self.envs.num_envs
+        self.step += self.envs.num_envs * self.num_agents
         return infos
 
     def get_minibatches(self, gamma: float, gae_lambda: float) -> list[ReplayMinibatch]:
@@ -575,12 +613,15 @@ class PPOTrainer:
         self.actor, self.critic = get_actor_and_critic(self.envs, mode=args.mode)
         self.optimizer, self.scheduler = make_optimizer(self.actor, self.critic, args.total_training_steps, args.lr)
 
+        # get the get_obs_for_agent function
+        get_obs_for_agent = get_obs_for_agent_function(mode=args.mode)
+
         # Create our agent
-        self.agent = PPOAgent(self.envs, self.actor, self.critic, self.memory)
+        self.agents = PPOAgents(self.envs, self.actor, self.critic, self.memory, self.args.num_agents, get_obs_for_agent)
 
     def rollout_phase(self) -> dict | None:
         """
-        This function populates the memory with a new set of experiences, using `self.agent.play_step` to step through
+        This function populates the memory with a new set of experiences, using `self.agents.play_step` to step through
         the environment. It also returns a dict of data which you can include in your progress bar postfix.
         """
         data = None
@@ -588,18 +629,18 @@ class PPOTrainer:
 
         for step in range(self.args.num_steps_per_rollout):
             # Play a step, returning the infos dict (containing information for each environment)
-            infos = self.agent.play_step()
+            infos = self.agents.play_step()
 
             # Get data from environments, and log it if some environment did actually terminate
             new_data = get_episode_data_from_infos(infos)
             if new_data is not None:
                 data = new_data
                 if self.args.use_wandb:
-                    wandb.log(new_data, step=self.agent.step)
+                    wandb.log(new_data, step=self.agents.step)
 
         if self.args.use_wandb:
             wandb.log(
-                {"SPS": (self.args.num_steps_per_rollout * self.num_envs) / (time.time() - t0)}, step=self.agent.step
+                {"SPS": (self.args.num_steps_per_rollout * self.num_envs) / (time.time() - t0)}, step=self.agents.step
             )
 
         return data
@@ -612,7 +653,7 @@ class PPOTrainer:
             - Clips the gradients (see detail #11)
             - Steps the learning rate scheduler
         """
-        minibatches = self.agent.get_minibatches(self.args.gamma, self.args.gae_lambda)
+        minibatches = self.agents.get_minibatches(self.args.gamma, self.args.gae_lambda)
         for minibatch in minibatches:
             objective_fn = self.compute_ppo_objective(minibatch)
             objective_fn.backward()
@@ -648,7 +689,7 @@ class PPOTrainer:
         if self.args.use_wandb:
             wandb.log(
                 dict(
-                    total_steps=self.agent.step,
+                    total_steps=self.agents.step,
                     values=values.mean().item(),
                     lr=self.scheduler.optimizer.param_groups[0]["lr"],
                     value_loss=value_loss.item(),
@@ -657,7 +698,7 @@ class PPOTrainer:
                     approx_kl=approx_kl,
                     clipfrac=np.mean(clipfracs),
                 ),
-                step=self.agent.step,
+                step=self.agents.step,
             )
 
         return total_objective_function
@@ -703,7 +744,7 @@ def test_probe(probe_idx: int):
     )
     trainer = PPOTrainer(args)
     trainer.train()
-    agent = trainer.agent
+    agents = trainer.agents
 
     # Get the correct set of observations, and corresponding values we expect
     obs_for_probes = [[[0.0]], [[-1.0], [+1.0]], [[0.0], [1.0]], [[0.0]], [[0.0], [1.0]]]
@@ -714,8 +755,8 @@ def test_probe(probe_idx: int):
 
     # Calculate the actual value & probs, and verify them
     with t.inference_mode():
-        value = agent.critic(obs)
-        probs = agent.actor(obs).softmax(-1)
+        value = agents.critic(obs)
+        probs = agents.actor(obs).softmax(-1)
     expected_value = t.tensor(expected_value_for_probes[probe_idx - 1]).to(device)
     t.testing.assert_close(value, expected_value, atol=tolerances[probe_idx - 1], rtol=0)
     expected_probs = expected_probs_for_probes[probe_idx - 1]
