@@ -2,3 +2,4 @@
 ppo/__pycache__
 ppo/videos
 ppo/wandb
+.vscode
