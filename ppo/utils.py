@@ -116,7 +116,7 @@ def plot_buffer_items(df, title):
 
 def arg_help(args, print_df=False, filename: str | None = None):
     """Prints out a nicely displayed list of arguments, their default values, and what they mean."""
-    from ppo import ARG_HELP_STRINGS, DQNArgs
+    from mappo import ARG_HELP_STRINGS, DQNArgs
 
     if args is None:
         args = DQNArgs()
@@ -425,7 +425,7 @@ def ewma(arr: Arr, alpha: float):
 
 
 def arg_help(args, print_df=False):
-    from ppo import ARG_HELP_STRINGS, PPOArgs
+    from mappo import ARG_HELP_STRINGS, PPOArgs
 
     """Prints out a nicely displayed list of arguments, their default values, and what they mean."""
     if args is None:

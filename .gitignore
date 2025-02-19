@@ -1,5 +1,7 @@
 .env
 ppo/__pycache__
+ppo/environments/__pycache__
 ppo/videos
+wandb
 ppo/wandb
 .vscode

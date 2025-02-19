@@ -491,7 +491,11 @@ class PPOAgents:
         agent_actions = t.stack(agent_actions, axis=1)
 
         # Step environment based on the sampled action
-        next_obs_global, rewards, next_terminated, next_truncated, infos = self.envs.step(agent_actions.cpu().numpy().squeeze())
+        if self.num_agents == 1:
+            input_actions = agent_actions.cpu().numpy().squeeze()
+        else:
+            input_actions = agent_actions.cpu().numpy()
+        next_obs_global, rewards, next_terminated, next_truncated, infos = self.envs.step(input_actions)
 
         # Calculate logprobs and values, and add this all to replay memory
         with t.inference_mode():
@@ -746,7 +750,7 @@ class PPOTrainer:
         return total_objective_function
 
     def train(self) -> None:
-        if args.use_wandb:
+        if self.args.use_wandb:
             wandb.init(
                 project=self.args.wandb_project_name,
                 entity=self.args.wandb_entity,
@@ -764,6 +768,8 @@ class PPOTrainer:
                 last_logged_time = time.time()
                 pbar.set_postfix(phase=phase, **data)
 
+            # if phase >= 40:
+            #     print("phase", phase)
             self.learning_phase()
 
         self.envs.close()
@@ -783,6 +789,7 @@ def test_probe(probe_idx: int):
         lr=0.001,
         video_log_freq=None,
         use_wandb=False,
+        num_envs=1,
     )
     trainer = PPOTrainer(args)
     trainer.train()
@@ -806,21 +813,36 @@ def test_probe(probe_idx: int):
         t.testing.assert_close(probs, t.tensor(expected_probs).to(device), atol=tolerances[probe_idx - 1], rtol=0)
     print("Probe tests passed!\n")
 
+
 # %%
+gym.envs.registration.register(id="MappoTest-v0", entry_point=MappoTest)
+def test_mappo():
+    args = PPOArgs(
+        env_id="MappoTest-v0",
+        mode="mappo-test",
+        num_agents=2,
+        total_timesteps=25_000,
+        use_wandb=False,
+        gamma=0.0,
+        num_envs=4,
+    )
+    trainer = PPOTrainer(args)
+    trainer.train()
+    agents = trainer.agents
+    obs = t.tensor([[[1.0, 0.0, 1.0, 0.0], [1.0, 0.0, 1.0, 0.0]]]).to(device)
+    with t.inference_mode():
+        value = agents.critic(obs)
+    print(value)
+    expected_value = t.tensor([[1.0]]).to(device)
+    t.testing.assert_close(value, expected_value, atol=1e-2, rtol=0)
+    print("Mappo test passed!")
+
+
 # if MAIN:
 #     for probe_idx in range(1, 6):
 #         test_probe(probe_idx)
-
-
-# %%
 if MAIN:
-    gym.envs.registration.register(id="MappoTest-v0", entry_point=MappoTest)
-    env = gym.make("MappoTest-v0")
-    assert env.observation_space.shape == (2, 4)
-    assert env.action_space.shape == (2,)
-    args = PPOArgs(env_id="MappoTest-v0", mode="mappo-test", num_agents=2, total_timesteps=100_000, use_wandb=True, gamma=0.0)
-    trainer = PPOTrainer(args)
-    trainer.train()
+    test_mappo()
 
 # %%
 if MAIN:

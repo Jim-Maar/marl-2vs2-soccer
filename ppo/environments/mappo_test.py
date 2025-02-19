@@ -37,12 +37,17 @@ class MappoTest(gym.Env):
     action_space: MultiDiscrete
     observation_space: Box
 
+    def update_positions_global(self):
+        self.agent_positions_global = self.agent_positions_local.copy()
+        self.agent_positions_global[1, 0] = abs(self.agent_positions_local[1, 0] - 2)
+        # print(self.agent_positions_global, self.agent_positions_local)
+
     def get_observations(self) -> np.ndarray:
-        x1 = self.agent_positions[0, 0]
-        y1 = self.agent_positions[0, 1]
-        x2 = self.agent_positions[1, 0]
-        y2 = self.agent_positions[1, 1]
-        return np.array([[x1, y1, x2, y2], [x2, y2, x1, y1]])
+        x1 = self.agent_positions_global[0, 0]
+        y1 = self.agent_positions_global[0, 1]
+        x2 = self.agent_positions_global[1, 0]
+        y2 = self.agent_positions_global[1, 1]
+        return np.array([[x1, y1, x2, y2], [abs(x2 - 2), y2, abs(x1 - 2), y1]])
 
     def __init__(self, render_mode: str = "rgb_array"):
         super().__init__()
@@ -55,27 +60,34 @@ class MappoTest(gym.Env):
         self.action_space = MultiDiscrete([5, 5])
         self.reset()
 
-    def step(self, action: ActType) -> tuple[ObsType, float, bool, dict]:
+    def step(self, actions: ActType) -> tuple[ObsType, float, bool, dict]:
         for i in range(self.num_agents):
-            if action[i] == UP:
-                self.agent_positions[i, 1] = min(self.agent_positions[i, 1] + 1, 2)
-            elif action[i] == DOWN:
-                self.agent_positions[i, 1] = max(self.agent_positions[i, 1] - 1, 0)
-            elif action[i] == LEFT:
-                self.agent_positions[i, 0] = max(self.agent_positions[i, 0] - 1, 0)
-            elif action[i] == RIGHT:
-                self.agent_positions[i, 0] = min(self.agent_positions[i, 0] + 1, 2)
-            elif action[i] == NO_OP:
+            if actions[i] == UP:
+                self.agent_positions_local[i, 1] = min(self.agent_positions_local[i, 1] + 1, 2)
+            elif actions[i] == DOWN:
+                self.agent_positions_local[i, 1] = max(self.agent_positions_local[i, 1] - 1, 0)
+            elif actions[i] == LEFT:
+                self.agent_positions_local[i, 0] = max(self.agent_positions_local[i, 0] - 1, 0)
+            elif actions[i] == RIGHT:
+                self.agent_positions_local[i, 0] = min(self.agent_positions_local[i, 0] + 1, 2)
+            elif actions[i] == NO_OP:
                 pass
-        reward = 1.0 if np.array_equal(self.agent_positions[0], self.agent_positions[1]) else 0.0
-        truncated = self.num_steps >= self.max_steps
+
+        self.update_positions_global()
+        reward = 1.0 if np.array_equal(self.agent_positions_global[0], self.agent_positions_global[1]) else 0.0
+        truncated = False
         terminated = False
+        self.num_steps += 1
+        if self.num_steps >= self.max_steps:
+            truncated = True
+            self.reset()
         return self.get_observations(), reward, terminated, truncated, {}
 
     def reset(self, seed: int | None = None, options=None) -> ObsType | tuple[ObsType, dict]:
         super().reset(seed=seed)
-        self.agent_positions = np.array([[0, 0], [0, 2]])
+        self.agent_positions_local = np.array([[0, 0], [0, 0]])
         self.num_steps = 0
+        self.update_positions_global()
         return self.get_observations(), {}
 
 if MAIN:
