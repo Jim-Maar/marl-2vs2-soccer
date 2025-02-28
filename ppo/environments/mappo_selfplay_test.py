@@ -28,7 +28,7 @@ LEFT = 2
 RIGHT = 3
 NO_OP = 4
 
-class MappoTest(gym.Env):
+class MappoSelfplayTest(gym.Env):
     """One action, observation of [0.0], one timestep long, +1 reward.
 
     We expect the agent to rapidly learn that the value of the constant [0.0] observation is +1.0. Note we're using a continuous observation space for consistency with CartPole.
@@ -79,8 +79,6 @@ class MappoTest(gym.Env):
             observations.append(np.concatenate(agent_observation))
         return np.array(observations)
 
-
-
     def __init__(self, render_mode: str = "rgb_array"):
         super().__init__()
         self.num_agents = 4
@@ -88,8 +86,8 @@ class MappoTest(gym.Env):
         self.num_teams = self.num_agents // self.team_size
         self.max_steps = 10
         self.observation_space = Box(
-            low=np.array([[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]),
-            high=np.array([[2, 2, 2, 2], [2, 2, 2, 2], [2, 2, 2, 2], [2, 2, 2, 2]]),
+            low=np.array([[0 for _ in range(self.num_agents * 2)] for _ in range(self.num_agents)]),
+            high=np.array([[2 for _ in range(self.num_agents * 2)] for _ in range(self.num_agents)]),
         )
         self.action_space = MultiDiscrete([5, 5, 5, 5])
         self.reset()
@@ -108,17 +106,20 @@ class MappoTest(gym.Env):
                 pass
 
         self.update_positions_global()
-        rewards = np.zeros(self.tean_size)
-        for i in range(self.team_size):
-            if np.array_equal(self.agent_positions_global[0], self.agent_positions_global[1]):
-                rewards[i] = 1.0
+        rewards = np.zeros(self.num_agents)
+        for i in range(self.num_teams):
+            agent1 = i * self.team_size
+            agent2 = agent1 + 1
+            if np.array_equal(self.agent_positions_global[agent1], self.agent_positions_global[agent2]):
+                rewards[agent1] = 1.0
+                rewards[agent2] = 1.0
         truncated = False
         terminated = False
         self.num_steps += 1
         if self.num_steps >= self.max_steps:
             truncated = True
             self.reset()
-        return self.get_observations(), rewards, terminated, truncated, {}
+        return self.get_observations(), rewards[0], terminated, truncated, {"other_reward" : rewards[1:]}
 
     def reset(self, seed: int | None = None, options=None) -> ObsType | tuple[ObsType, dict]:
         super().reset(seed=seed)

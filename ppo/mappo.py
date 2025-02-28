@@ -32,6 +32,7 @@ warnings.filterwarnings("ignore")
 from utils import set_global_seeds
 from environments.probes import Probe1, Probe2, Probe3, Probe4, Probe5, get_episode_data_from_infos
 from environments.mappo_test import MappoTest
+from environments.mappo_selfplay_test import MappoSelfplayTest
 from utils import prepare_atari_env
 from utils import arg_help, make_env
 from plotly_utils import plot_cartpole_obs_and_dones
@@ -87,6 +88,7 @@ class PPOArgs:
 
     # multi-agent specific
     num_agents: int = 1
+    num_teams: int = 1
 
     def __post_init__(self):
         self.batch_size = self.num_steps_per_rollout * self.num_envs
@@ -130,6 +132,7 @@ ARG_HELP_STRINGS = dict(
     total_training_steps="total number of minibatches we will perform an update step on during training (calculated from other values in PPOArgs)",
     #
     num_agents="number of agents in the multi-agent case",
+    num_teams="number of teams in the multi-agent case",
 )
 
 
@@ -146,15 +149,15 @@ def layer_init(layer: nn.Linear, std=np.sqrt(2), bias_const=0.0):
 
 def get_actor_and_critic(
     envs: gym.vector.SyncVectorEnv,
-    mode: Literal["classic-control", "atari", "mujoco", "mappo-test", "soccer"] = "classic-control",
+    mode: Literal["classic-control", "atari", "mujoco", "mappo-test", "soccer", "mappo-selfplay-test"] = "classic-control",
 ) -> tuple[nn.Module, nn.Module]:
     """
     Returns (actor, critic), the networks used for PPO, in one of 3 different modes.
     """
-    assert mode in ["classic-control", "atari", "mujoco", "mappo-test", "soccer"]
+    assert mode in ["classic-control", "atari", "mujoco", "mappo-test", "soccer", "mappo-selfplay-test"]
 
     obs_global_shape = envs.single_observation_space.shape
-    if mode == "mappo-test" or mode == "soccer":
+    if mode == "mappo-test" or mode == "soccer" or mode == "mappo-selfplay-test":
         num_agents = obs_global_shape[0]
         obs_shape = obs_global_shape[1:]
     else:
@@ -175,15 +178,15 @@ def get_actor_and_critic(
         actor, critic = get_actor_and_critic_atari(obs_shape, num_actions)  # you'll implement these later
     if mode == "mujoco":
         actor, critic = get_actor_and_critic_mujoco(num_obs, num_actions)  # you'll implement these later
-    if mode == "mappo-test":
-        actor, critic = get_actor_and_critic_mappo_test(num_obs, num_actions, num_agents)  # you'll implement these later
+    if mode == "mappo-test" or mode == "mappo-selfplay-test":
+        actor, critic = get_actor_and_critic_mappo_test(num_obs, num_actions)  # you'll implement these later
     if mode == "soccer":
         actor, critic = get_actor_and_critic_soccer(num_obs, num_actions, num_agents)  # you'll implement these later
 
     return actor.to(device), critic.to(device)
 
 
-def get_actor_and_critic_mappo_test(num_obs: int, num_actions: int, num_agents: int):
+def get_actor_and_critic_mappo_test(num_obs: int, num_actions: int):
     actor = nn.Sequential(
         layer_init(nn.Linear(num_obs, 64)),
         nn.Tanh(),
@@ -192,8 +195,7 @@ def get_actor_and_critic_mappo_test(num_obs: int, num_actions: int, num_agents: 
         layer_init(nn.Linear(64, num_actions), std=0.01),
     )
     critic = nn.Sequential(
-        nn.Flatten(),
-        layer_init(nn.Linear(num_agents * num_obs, 64)),
+        layer_init(nn.Linear(num_obs, 64)),
         nn.Tanh(),
         layer_init(nn.Linear(64, 64)),
         nn.Tanh(),
@@ -237,14 +239,14 @@ def get_actor_and_critic_classic(num_obs: int, num_actions: int):
 
 @t.inference_mode()
 def compute_advantages(
-    next_value: Float[Tensor, "num_envs"],
-    next_terminated: Bool[Tensor, "num_envs"],
-    rewards: Float[Tensor, "buffer_size num_envs"],
-    values: Float[Tensor, "buffer_size num_envs"],
-    terminated: Bool[Tensor, "buffer_size num_envs"],
+    next_value: Float[Tensor, "num_envs num_agents"],
+    next_terminated: Bool[Tensor, "num_envs num_agents"],
+    rewards: Float[Tensor, "buffer_size num_envs num_agents"],
+    values: Float[Tensor, "buffer_size num_envs num_agents"],
+    terminated: Bool[Tensor, "buffer_size num_envs num_agents"],
     gamma: float,
     gae_lambda: float,
-) -> Float[Tensor, "buffer_size num_envs"]:
+) -> Float[Tensor, "buffer_size num_envs num_agents"]:
     """
     Compute advantages using Generalized Advantage Estimation.
     """
@@ -253,8 +255,8 @@ def compute_advantages(
     next_terminated = next_terminated.float()
 
     # Get tensors of V(s_{t+1}) and d_{t+1} for all t = 0, 1, ..., T-1
-    next_values = t.concat([values[1:], next_value[None, :]])
-    next_terminated = t.concat([terminated[1:], next_terminated[None, :]])
+    next_values = t.concat([values[1:], next_value[None, :, :]])
+    next_terminated = t.concat([terminated[1:], next_terminated[None, :, :]])
 
     # Compute deltas: \delta_t = r_t + (1 - d_{t+1}) \gamma V(s_{t+1}) - V(s_t)
     deltas = rewards + gamma * next_values * (1.0 - next_terminated) - values
@@ -294,7 +296,7 @@ class ReplayMinibatch:
     advantages: Float[Tensor, "minibatch_size"]
     returns: Float[Tensor, "minibatch_size"]
     terminated: Bool[Tensor, "minibatch_size"]
-
+    agent_idx: Int[Tensor, "minibatch_size"]
 
 class ReplayMemory:
     """
@@ -302,17 +304,19 @@ class ReplayMemory:
     """
 
     rng: Generator
-    obs: Float[Arr, "buffer_size num_envs *obs_shape"]
-    obs_global: Float[Arr, "buffer_size num_envs *obs_global_shape"]
-    actions: Int[Arr, "buffer_size num_envs *action_shape"]
-    logprobs: Float[Arr, "buffer_size num_envs"]
-    values: Float[Arr, "buffer_size num_envs"]
-    rewards: Float[Arr, "buffer_size num_envs"]
-    terminated: Bool[Arr, "buffer_size num_envs"]
+    obs: Float[Arr, "buffer_size num_envs num_agents *obs_shape"]
+    obs_global: Float[Arr, "buffer_size num_envs num_agents *obs_global_shape"]
+    actions: Int[Arr, "buffer_size num_envs num_agents *action_shape"]
+    logprobs: Float[Arr, "buffer_size num_envs num_agents"]
+    values: Float[Arr, "buffer_size num_envs num_agents"]
+    rewards: Float[Arr, "buffer_size num_envs num_agents"]
+    terminated: Bool[Arr, "buffer_size num_envs num_agents"]
+    agent_idx: Int[Arr, "buffer_size num_envs num_agents"]
 
     def __init__(
         self,
         num_envs: int,
+        num_agents: int,
         obs_shape: tuple,
         obs_global_shape: tuple,
         action_shape: tuple,
@@ -322,6 +326,7 @@ class ReplayMemory:
         seed: int = 42,
     ):
         self.num_envs = num_envs
+        self.num_agents = num_agents
         self.obs_shape = obs_shape
         self.obs_global_shape = obs_global_shape
         self.action_shape = action_shape
@@ -333,40 +338,44 @@ class ReplayMemory:
 
     def reset(self):
         """Resets all stored experiences, ready for new ones to be added to memory."""
-        self.obs = np.empty((0, self.num_envs, *self.obs_shape), dtype=np.float32)
-        self.obs_global = np.empty((0, self.num_envs, *self.obs_global_shape), dtype=np.float32)
-        self.actions = np.empty((0, self.num_envs, *self.action_shape), dtype=np.int32)
-        self.logprobs = np.empty((0, self.num_envs), dtype=np.float32)
-        self.values = np.empty((0, self.num_envs), dtype=np.float32)
-        self.rewards = np.empty((0, self.num_envs), dtype=np.float32)
-        self.terminated = np.empty((0, self.num_envs), dtype=bool)
+        self.obs = np.empty((0, self.num_envs, self.num_agents, *self.obs_shape), dtype=np.float32)
+        self.obs_global = np.empty((0, self.num_envs, self.num_agents, *self.obs_global_shape), dtype=np.float32)
+        self.actions = np.empty((0, self.num_envs, self.num_agents, *self.action_shape), dtype=np.int32)
+        self.logprobs = np.empty((0, self.num_envs, self.num_agents), dtype=np.float32)
+        self.values = np.empty((0, self.num_envs, self.num_agents), dtype=np.float32)
+        self.rewards = np.empty((0, self.num_envs, self.num_agents), dtype=np.float32)
+        self.terminated = np.empty((0, self.num_envs, self.num_agents), dtype=bool)
+        self.agent_idx = einops.repeat(np.arange(self.num_agents), "num_agents -> minibatch_size num_envs num_agents", minibatch_size=self.minibatch_size, num_envs=self.num_envs)
 
     def add(
         self,
-        obs: Float[Arr, "num_envs *obs_shape"],
-        obs_global: Float[Arr, "num_envs *obs_shape"],
-        actions: Int[Arr, "num_envs *action_shape"],
-        logprobs: Float[Arr, "num_envs"],
-        values: Float[Arr, "num_envs"],
-        rewards: Float[Arr, "num_envs"],
-        terminated: Bool[Arr, "num_envs"],
+        obs: Float[Arr, "num_envs num_agents *obs_shape"],
+        obs_global: Float[Arr, "num_envs num_agents *obs_global_shape"],
+        actions: Int[Arr, "num_envs num_agents *action_shape"],
+        logprobs: Float[Arr, "num_envs num_agents"],
+        values: Float[Arr, "num_envs num_agents"],
+        rewards: Float[Arr, "num_envs num_agents"],
+        terminated: Bool[Arr, "num_envs num_agents"],
     ) -> None:
         """Add a batch of transitions to the replay memory."""
         # Check shapes & datatypes
         for data, expected_shape in zip(
-            [obs, obs_global, actions, logprobs, values, rewards, terminated], [self.obs_shape, self.obs_global_shape, self.action_shape, (), (), (), ()]
+            [obs, obs_global, actions, logprobs, values, rewards, terminated], [(self.num_agents, *self.obs_shape), (self.num_agents, *self.obs_global_shape), (self.num_agents, *self.action_shape), (self.num_agents, ), (self.num_agents, ), (self.num_agents, ), (self.num_agents, )]
         ):
             assert isinstance(data, np.ndarray)
             assert data.shape == (self.num_envs, *expected_shape)
 
         # Add data to buffer (not slicing off old elements)
-        self.obs = np.concatenate((self.obs, obs[None, :]))
-        self.obs_global = np.concatenate((self.obs_global, obs_global[None, :]))
-        self.actions = np.concatenate((self.actions, actions[None, :]))
-        self.logprobs = np.concatenate((self.logprobs, logprobs[None, :]))
-        self.values = np.concatenate((self.values, values[None, :]))
-        self.rewards = np.concatenate((self.rewards, rewards[None, :]))
-        self.terminated = np.concatenate((self.terminated, terminated[None, :]))
+        self.obs = np.concatenate((self.obs, obs[None, :, :]))
+        self.obs_global = np.concatenate((self.obs_global, obs_global[None, :, :]))
+        self.actions = np.concatenate((self.actions, actions[None, :, :]))
+        self.logprobs = np.concatenate((self.logprobs, logprobs[None, :, :]))
+        self.values = np.concatenate((self.values, values[None, :, :]))
+        self.rewards = np.concatenate((self.rewards, rewards[None, :, :]))
+        self.terminated = np.concatenate((self.terminated, terminated[None, :, :]))
+        # Create array filled with agent_idx and concatenate
+        # agent_idx_array = np.full((self.num_envs), fill_value=agent_idx, dtype=np.int32)
+        # self.agent_idx = np.concatenate((self.agent_idx, agent_idx_array[None, :]))
 
     def get_minibatches(
         self, next_value: Tensor, next_terminated: Tensor, gamma: float, gae_lambda: float
@@ -376,9 +385,9 @@ class ReplayMemory:
         `batches_per_learning_phase` copies of the entire replay memory.
         """
         # Convert everything to tensors on the correct device
-        obs, obs_global, actions, logprobs, values, rewards, terminated = (
+        obs, obs_global, actions, logprobs, values, rewards, terminated, agent_idx = (
             t.tensor(x, device=device)
-            for x in [self.obs, self.obs_global, self.actions, self.logprobs, self.values, self.rewards, self.terminated]
+            for x in [self.obs, self.obs_global, self.actions, self.logprobs, self.values, self.rewards, self.terminated, self.agent_idx]
         )
 
         # Compute advantages & returns
@@ -392,8 +401,8 @@ class ReplayMemory:
                 minibatches.append(
                     ReplayMinibatch(
                         *[
-                            data.flatten(0, 1)[indices]
-                            for data in [obs, obs_global, actions, logprobs, advantages, returns, terminated]
+                            data.flatten(0, 2)[indices]
+                            for data in [obs, obs_global, actions, logprobs, advantages, returns, terminated, agent_idx]
                         ]
                     )
                 )
@@ -445,23 +454,45 @@ if MAIN:
     )
 """
 
+def get_team_rewards(reward: Float[Arr, "num_envs"], infos: dict, num_agents: int) -> Float[Arr, "num_envs num_teams"]:
+    # TODO: test this for more than two agents ...
+    if num_agents == 1:
+        return reward[:, None]
+    if num_agents == 2:
+        if "final_info" in infos:
+            assert "other_reward" in infos["final_info"][0]
+            other_reward = np.array([info["other_reward"] for info in infos["final_info"]])
+        else:
+            assert "other_reward" in infos
+            other_reward = infos["other_reward"][:, None]
+    if num_agents > 2:
+        if "final_info" in infos:
+            assert "other_reward" in infos["final_info"][0]
+            other_reward = np.array([info["other_reward"] for info in infos["final_info"]])
+        else:
+            assert "other_reward" in infos
+            other_reward = np.stack(infos["other_reward"], axis=0)
+    return np.concatenate([reward[:, None], other_reward], axis=1)
+
 # %%
 class PPOAgents:
     critic: nn.Sequential
     actor: nn.Sequential
 
-    def __init__(self, envs: gym.vector.SyncVectorEnv, actor: nn.Module, critic: nn.Module, memory: ReplayMemory, num_agents: int):
+    def __init__(self, envs: gym.vector.SyncVectorEnv, actor: nn.Module, critic: nn.Module, memory: ReplayMemory, num_agents: int, num_teams: int):
         super().__init__()
         self.envs = envs
         self.actor = actor
         self.critic = critic
         self.memory = memory
         self.num_agents = num_agents
+        self.num_teams = num_teams
+        self.team_size = num_agents // num_teams
         # self.get_obs_for_agent = get_obs_for_agent
 
         self.step = 0  # Tracking number of steps taken (across all environments)
         self.next_obs = t.tensor(envs.reset()[0], device=device, dtype=t.float)  # need starting obs (in tensor form)
-        self.next_terminated = t.zeros(envs.num_envs, device=device, dtype=t.bool)  # need starting termination=False
+        self.next_terminated = t.zeros((envs.num_envs, self.num_agents), device=device, dtype=t.bool)  # need starting termination=False
 
     def play_step(self) -> list[dict]:
         """
@@ -472,41 +503,71 @@ class PPOAgents:
         # Get newest observations (i.e. where we're starting from)
         obs_global = self.next_obs
         if self.num_agents == 1:
-            obs_global = obs_global[:, None]
+            obs_global = obs_global.unsqueeze(dim=1)
         terminated = self.next_terminated
 
         # Compute logits based on newest observation, and use it to get an action distribution we sample from
         # TODO: add multiple agents, sample the action of each of them
-        agent_actions = []
-        agent_dists = []
-        for agent_idx in range(self.num_agents):
-            # obs = self.get_obs_for_agent(obs_global, agent_idx)
-            obs = obs_global[:, agent_idx]
-            with t.inference_mode():
-                logits = self.actor(obs)
-            dist = Categorical(logits=logits)
-            actions = dist.sample()
-            agent_actions.append(actions)
-            agent_dists.append(dist)
-        agent_actions = t.stack(agent_actions, axis=1)
+        with t.inference_mode():
+            logits = self.actor(obs_global)
+        dist = Categorical(logits=logits)
+        actions = dist.sample()
+        logprobs = dist.log_prob(actions)
 
         # Step environment based on the sampled action
         if self.num_agents == 1:
-            input_actions = agent_actions.cpu().numpy().squeeze()
+            input_actions = actions.squeeze(dim=1).cpu().numpy()
         else:
-            input_actions = agent_actions.cpu().numpy()
-        next_obs_global, rewards, next_terminated, next_truncated, infos = self.envs.step(input_actions)
-
+            input_actions = actions.cpu().numpy()
+        next_obs_global, reward, next_terminated, next_truncated, infos = self.envs.step(input_actions)
+        rewards = get_team_rewards(reward, infos, self.num_agents)
+        assert rewards.shape == (self.envs.num_envs, self.num_agents)
+        next_terminated = einops.repeat(next_terminated, "num_envs -> num_envs num_agents", num_agents=self.num_agents)
+        next_truncated = einops.repeat(next_truncated, "num_envs -> num_envs num_agents", num_agents=self.num_agents)
+        
         # Calculate logprobs and values, and add this all to replay memory
+        # Vectorize code down below to compute everything for every agent at the same time (every shape should start with (num_envs, num_agents))
+        environment_idx = t.arange(self.envs.num_envs, device=device)
+        agent_idx = t.arange(self.num_agents, device=device)
+        team_idx = agent_idx // self.team_size
+        first_agent_idx = team_idx * self.team_size
+        team_obs = obs_global[:, first_agent_idx, :]
         with t.inference_mode():
-            values = self.critic(obs_global).flatten().cpu().numpy()
+            values = self.critic(team_obs).squeeze(dim=-1).cpu().numpy()
+
+        self.memory.add(
+            obs = obs_global.cpu().numpy(),
+            obs_global = team_obs.cpu().numpy(),
+            actions = actions.cpu().numpy(),
+            logprobs = logprobs.cpu().numpy(),
+            values = values,
+            rewards = rewards,
+            terminated = terminated.cpu().numpy(),
+        )
+        """values = []
+        for team_idx in range(self.num_teams):
+            first_agent_idx = team_idx * self.team_size
+            team_obs = obs_global[:, first_agent_idx]
+            with t.inference_mode():
+                values.append(self.critic(team_obs).flatten().cpu().numpy()) # TODO: .flatten needed?
+        values = np.stack(values, axis=1)
         # Add to memory for each agent (obs, action, logprob seperately) (values, rewards, terminated together)
         for agent_idx in range(self.num_agents):
+            team_idx = agent_idx // self.team_size
             actions = agent_actions[:, agent_idx]
             obs = obs_global[:, agent_idx]
             dist = agent_dists[agent_idx]
             logprobs = dist.log_prob(actions).cpu().numpy()
-            self.memory.add(obs.cpu().numpy(), obs_global.squeeze(dim=1).cpu().numpy(), actions.cpu().numpy(), logprobs, values, rewards, terminated.cpu().numpy())
+            self.memory.add(
+                obs.cpu().numpy(),
+                obs_global.cpu().numpy(),
+                actions.cpu().numpy(),
+                logprobs,
+                values[:, team_idx],
+                rewards[:, team_idx],
+                terminated.cpu().numpy(),
+                agent_idx,
+            )"""
 
         # Set next observation & termination state
         self.next_obs = t.from_numpy(next_obs_global).to(device, dtype=t.float)
@@ -520,11 +581,11 @@ class PPOAgents:
         Gets minibatches from the replay memory, and resets the memory
         """
         with t.inference_mode():
-            next_value = self.critic(self.next_obs).flatten()
+            next_value = self.critic(self.next_obs).squeeze(dim=-1)
         minibatches = self.memory.get_minibatches(next_value, self.next_terminated, gamma, gae_lambda)
         self.memory.reset()
         return minibatches
-
+ 
 
 def calc_clipped_surrogate_objective(
     probs: Categorical,
@@ -622,15 +683,26 @@ def make_optimizer(
     scheduler = PPOScheduler(optimizer, initial_lr, end_lr, total_phases)
     return optimizer, scheduler
 
+def make_env_wrapper(idx: int, run_name: str, args: PPOArgs, mode: str) -> gym.Env:
+    if mode == "mappo-test":
+        return MappoTest
+    else:
+        return make_env(idx=idx, run_name=run_name, **args.__dict__)
 
 class PPOTrainer:
     def __init__(self, args: PPOArgs):
         set_global_seeds(args.seed)
         self.args = args
         self.run_name = f"{args.env_id}__{args.wandb_project_name}__seed{args.seed}__{time.strftime('%Y%m%d-%H%M%S')}"
-        self.envs = gym.vector.SyncVectorEnv(
-            [make_env(idx=idx, run_name=self.run_name, **args.__dict__) for idx in range(args.num_envs)]
-        )
+        # self.envs = gym.vector.SyncVectorEnv(
+        #     [make_env(idx=idx, run_name=self.run_name, **args.__dict__) for idx in range(args.num_envs)]
+        # )
+        self.envs = gym.vector.SyncVectorEnv([make_env_wrapper(idx=idx, run_name=self.run_name, args=args, mode=args.mode) for idx in range(args.num_envs)])
+
+
+        self.num_agents = self.args.num_agents
+        self.num_teams = self.args.num_teams
+        self.team_size = self.num_agents // self.num_teams
 
         # Define some basic variables from our environment
         self.num_envs = self.envs.num_envs
@@ -639,14 +711,13 @@ class PPOTrainer:
             self.action_shape = self.action_shape[1:]
         self.obs_global_shape = self.envs.single_observation_space.shape
         if self.args.num_agents > 1:
-            self.obs_shape = self.obs_global_shape[1:]
-        else:
-            self.obs_shape = self.obs_global_shape
+            self.obs_global_shape = self.obs_global_shape[1:]
 
         # Create our replay memory
         self.memory = ReplayMemory(
             self.num_envs,
-            self.obs_shape,
+            self.num_agents,
+            self.obs_global_shape,
             self.obs_global_shape,
             self.action_shape,
             args.batch_size,
@@ -662,8 +733,8 @@ class PPOTrainer:
         # get the get_obs_for_agent function
         # get_obs_for_agent = get_obs_for_agent_function(mode=args.mode)
 
-        # Create our agent
-        self.agents = PPOAgents(self.envs, self.actor, self.critic, self.memory, self.args.num_agents)
+        # Create our agents
+        self.agents = PPOAgents(self.envs, self.actor, self.critic, self.memory, self.num_agents, self.num_teams)
 
     def rollout_phase(self) -> dict | None:
         """
@@ -714,6 +785,12 @@ class PPOTrainer:
         """
         Handles learning phase for a single minibatch. Returns objective function to be maximized.
         """
+        agent_idx = minibatch.agent_idx
+        team_idx = agent_idx // self.team_size
+        first_agent_idx = team_idx * self.team_size
+        indeces = t.arange(len(minibatch.obs_global))
+        # team_obs = minibatch.obs_global[indeces, first_agent_idx]
+    
         logits = self.actor(minibatch.obs)
         dist = Categorical(logits=logits)
         values = self.critic(minibatch.obs_global).squeeze()
@@ -789,7 +866,7 @@ def test_probe(probe_idx: int):
         lr=0.001,
         video_log_freq=None,
         use_wandb=False,
-        num_envs=1,
+        num_envs=4,
     )
     trainer = PPOTrainer(args)
     trainer.train()
@@ -815,13 +892,13 @@ def test_probe(probe_idx: int):
 
 
 # %%
-gym.envs.registration.register(id="MappoTest-v0", entry_point=MappoTest)
+gym.envs.registration.register(id="MappoTest-v0", entry_point=MappoTest, apply_api_compatibility=False)
 def test_mappo():
     args = PPOArgs(
         env_id="MappoTest-v0",
         mode="mappo-test",
         num_agents=2,
-        total_timesteps=25_000,
+        total_timesteps=35_000,
         use_wandb=False,
         gamma=0.0,
         num_envs=4,
@@ -829,7 +906,7 @@ def test_mappo():
     trainer = PPOTrainer(args)
     trainer.train()
     agents = trainer.agents
-    obs = t.tensor([[[1.0, 0.0, 1.0, 0.0], [1.0, 0.0, 1.0, 0.0]]]).to(device)
+    obs = t.tensor([[1.0, 0.0, 1.0, 0.0]]).to(device)
     with t.inference_mode():
         value = agents.critic(obs)
     print(value)
@@ -838,11 +915,37 @@ def test_mappo():
     print("Mappo test passed!")
 
 
+gym.envs.registration.register(id="MappoSelfplayTest-v0", entry_point=MappoSelfplayTest, apply_api_compatibility=False)
+def test_mappo_selfplay():
+    args = PPOArgs(
+        env_id="MappoSelfplayTest-v0",
+        mode="mappo-selfplay-test",
+        num_agents=4,
+        num_teams=2,
+        total_timesteps=35_000,
+        use_wandb=False,
+        gamma=0.0,
+        num_envs=4,
+    )
+    trainer = PPOTrainer(args)
+    trainer.train()
+    agents = trainer.agents
+    obs = t.tensor([[0.0, 0.0, 0.0, 0.0, 2.0, 2.0, 2.0, 2.0]]).to(device)
+    with t.inference_mode():
+        value = agents.critic(obs)
+    print(value)
+    expected_value = t.tensor([[1.0]]).to(device)
+    t.testing.assert_close(value, expected_value, atol=5 * 1e-2, rtol=0)
+
 # if MAIN:
 #     for probe_idx in range(1, 6):
 #         test_probe(probe_idx)
+
+# if MAIN:
+#     test_mappo()
+
 if MAIN:
-    test_mappo()
+    test_mappo_selfplay()
 
 # %%
 if MAIN:

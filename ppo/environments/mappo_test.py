@@ -75,13 +75,14 @@ class MappoTest(gym.Env):
 
         self.update_positions_global()
         reward = 1.0 if np.array_equal(self.agent_positions_global[0], self.agent_positions_global[1]) else 0.0
+        rewards = np.full((self.num_agents,), fill_value=reward)
         truncated = False
         terminated = False
         self.num_steps += 1
         if self.num_steps >= self.max_steps:
             truncated = True
             self.reset()
-        return self.get_observations(), reward, terminated, truncated, {}
+        return self.get_observations(), rewards[0], terminated, truncated, {"other_reward": rewards[1]}
 
     def reset(self, seed: int | None = None, options=None) -> ObsType | tuple[ObsType, dict]:
         super().reset(seed=seed)
