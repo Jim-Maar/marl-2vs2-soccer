@@ -33,6 +33,7 @@ from utils import set_global_seeds
 from environments.probes import Probe1, Probe2, Probe3, Probe4, Probe5, get_episode_data_from_infos
 from environments.mappo_test import MappoTest
 from environments.mappo_selfplay_test import MappoSelfplayTest
+from environments.soccer import Soccer
 from utils import prepare_atari_env
 from utils import arg_help, make_env
 from plotly_utils import plot_cartpole_obs_and_dones
@@ -181,25 +182,25 @@ def get_actor_and_critic(
     if mode == "mappo-test" or mode == "mappo-selfplay-test":
         actor, critic = get_actor_and_critic_mappo_test(num_obs, num_actions)  # you'll implement these later
     if mode == "soccer":
-        actor, critic = get_actor_and_critic_soccer(num_obs, num_actions, num_agents)  # you'll implement these later
+        actor, critic = get_actor_and_critic_classic(num_obs, num_actions)  # you'll implement these later
 
     return actor.to(device), critic.to(device)
 
 
 def get_actor_and_critic_mappo_test(num_obs: int, num_actions: int):
-    actor = nn.Sequential(
-        layer_init(nn.Linear(num_obs, 64)),
-        nn.Tanh(),
-        layer_init(nn.Linear(64, 64)),
-        nn.Tanh(),
-        layer_init(nn.Linear(64, num_actions), std=0.01),
-    )
     critic = nn.Sequential(
         layer_init(nn.Linear(num_obs, 64)),
         nn.Tanh(),
         layer_init(nn.Linear(64, 64)),
         nn.Tanh(),
         layer_init(nn.Linear(64, 1), std=1.0),
+    )
+    actor = nn.Sequential(
+        layer_init(nn.Linear(num_obs, 64)),
+        nn.Tanh(),
+        layer_init(nn.Linear(64, 64)),
+        nn.Tanh(),
+        layer_init(nn.Linear(64, num_actions), std=0.01),
     )
     return actor, critic
 
@@ -226,7 +227,6 @@ def get_actor_and_critic_classic(num_obs: int, num_actions: int):
         nn.Tanh(),
         layer_init(nn.Linear(64, 1), std=1.0),
     )
-
     actor = nn.Sequential(
         layer_init(nn.Linear(num_obs, 64)),
         nn.Tanh(),
@@ -467,8 +467,15 @@ def get_team_rewards(reward: Float[Arr, "num_envs"], infos: dict, num_agents: in
             other_reward = infos["other_reward"][:, None]
     if num_agents > 2:
         if "final_info" in infos:
-            assert "other_reward" in infos["final_info"][0]
-            other_reward = np.array([info["other_reward"] for info in infos["final_info"]])
+            other_reward = []
+            for env_idx in range(len(infos["final_info"])):
+                if infos["final_info"][env_idx] is None:
+                    other_reward.append(infos["other_reward"][env_idx])
+                else:
+                    other_reward.append(infos["final_info"][env_idx]["other_reward"])
+            other_reward = np.stack(other_reward, axis=0)
+            # other_reward = np.concatenate([np.stack(infos["other_reward"][:-1], axis=0), infos["final_info"][-1]["other_reward"][None, :]], axis=0)
+            # other_reward = np.array([info["other_reward"] for info in infos["final_info"]]) # might be important for mappo_selfplay_test
         else:
             assert "other_reward" in infos
             other_reward = np.stack(infos["other_reward"], axis=0)
@@ -491,6 +498,8 @@ class PPOAgents:
         # self.get_obs_for_agent = get_obs_for_agent
 
         self.step = 0  # Tracking number of steps taken (across all environments)
+        
+        # Original line that causes the error
         self.next_obs = t.tensor(envs.reset()[0], device=device, dtype=t.float)  # need starting obs (in tensor form)
         self.next_terminated = t.zeros((envs.num_envs, self.num_agents), device=device, dtype=t.bool)  # need starting termination=False
 
@@ -944,8 +953,22 @@ def test_mappo_selfplay():
 # if MAIN:
 #     test_mappo()
 
+# if MAIN:
+#     test_mappo_selfplay()
+
+gym.envs.registration.register(id="Soccer-v0", entry_point=Soccer, apply_api_compatibility=False)
 if MAIN:
-    test_mappo_selfplay()
+    args = PPOArgs(
+        env_id="Soccer-v0",
+        mode="soccer",
+        use_wandb=False,
+        video_log_freq=50,
+        num_envs=4,
+        num_agents=4,
+        num_teams=2,
+    )
+    trainer = PPOTrainer(args)
+    trainer.train()
 
 # %%
 if MAIN:

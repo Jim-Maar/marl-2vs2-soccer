@@ -77,7 +77,7 @@ class MappoSelfplayTest(gym.Env):
                 agent_position = self.get_local_position(self.agent_positions_global[j], i)
                 agent_observation.append(agent_position)
             observations.append(np.concatenate(agent_observation))
-        return np.array(observations)
+        return np.array(observations) # shape: (num_agents, num_agents * 2)
 
     def __init__(self, render_mode: str = "rgb_array"):
         super().__init__()
@@ -119,7 +119,7 @@ class MappoSelfplayTest(gym.Env):
         if self.num_steps >= self.max_steps:
             truncated = True
             self.reset()
-        return self.get_observations(), rewards[0], terminated, truncated, {"other_reward" : rewards[1:]}
+        return self.get_observations(), rewards[0], terminated, truncated, {"other_reward" : rewards[1:]} # other_reward is passed in the info dict. This is a bit hacky but was the only way to provide a seperate reward for all agents
 
     def reset(self, seed: int | None = None, options=None) -> ObsType | tuple[ObsType, dict]:
         super().reset(seed=seed)
@@ -127,9 +127,3 @@ class MappoSelfplayTest(gym.Env):
         self.num_steps = 0
         self.update_positions_global()
         return self.get_observations(), {}
-
-if MAIN:
-    gym.envs.registration.register(id="MappoTest-v0", entry_point=MappoTest)
-    env = gym.make("MappoTest-v0")
-    assert env.observation_space.shape == (2, 4)
-    assert env.action_space.shape == (2,)
