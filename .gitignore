@@ -5,3 +5,6 @@ ppo/videos
 wandb
 ppo/wandb
 .vscode
+logs
+models
+slurm

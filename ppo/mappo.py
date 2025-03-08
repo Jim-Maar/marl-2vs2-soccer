@@ -7,7 +7,7 @@ import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Callable
-
+import pickle
 import einops
 import gymnasium as gym
 import matplotlib.pyplot as plt
@@ -35,7 +35,7 @@ from environments.mappo_test import MappoTest
 from environments.mappo_selfplay_test import MappoSelfplayTest
 from environments.soccer import Soccer
 from utils import prepare_atari_env
-from utils import arg_help, make_env
+from utils import make_env
 from plotly_utils import plot_cartpole_obs_and_dones
 
 # Register our probes
@@ -53,6 +53,8 @@ MAIN = __name__ == "__main__" or is_debugging
 
 MODES = ["classic-control", "atari", "mujoco", "mappo-test", "soccer"]
 
+RUN_NAME = "new_rewards_high_num_per_rollout_3_layer_GELU"
+
 # %%
 @dataclass
 class PPOArgs:
@@ -64,7 +66,7 @@ class PPOArgs:
     # Wandb / logging
     use_wandb: bool = False
     video_log_freq: int | None = None
-    wandb_project_name: str = "PPOCartPole"
+    wandb_project_name: str = f"MAPPO_{RUN_NAME}"
     wandb_entity: str = None
 
     # Duration of different phases
@@ -136,12 +138,6 @@ ARG_HELP_STRINGS = dict(
     num_teams="number of teams in the multi-agent case",
 )
 
-
-if MAIN:
-    args = PPOArgs(num_minibatches=2)  # changing this also changes minibatch_size and total_training_steps
-    arg_help(args)
-
-
 def layer_init(layer: nn.Linear, std=np.sqrt(2), bias_const=0.0):
     t.nn.init.orthogonal_(layer.weight, std)
     t.nn.init.constant_(layer.bias, bias_const)
@@ -180,58 +176,46 @@ def get_actor_and_critic(
     if mode == "mujoco":
         actor, critic = get_actor_and_critic_mujoco(num_obs, num_actions)  # you'll implement these later
     if mode == "mappo-test" or mode == "mappo-selfplay-test":
-        actor, critic = get_actor_and_critic_mappo_test(num_obs, num_actions)  # you'll implement these later
-    if mode == "soccer":
         actor, critic = get_actor_and_critic_classic(num_obs, num_actions)  # you'll implement these later
+    if mode == "soccer":
+        actor, critic = get_actor_and_critic_soccer(num_obs, num_actions, 3)  # you'll implement these later
+        # actor, critic = get_actor_and_critic_classic(num_obs, num_actions)
 
     return actor.to(device), critic.to(device)
 
-
-def get_actor_and_critic_mappo_test(num_obs: int, num_actions: int):
-    critic = nn.Sequential(
-        layer_init(nn.Linear(num_obs, 64)),
-        nn.Tanh(),
-        layer_init(nn.Linear(64, 64)),
-        nn.Tanh(),
-        layer_init(nn.Linear(64, 1), std=1.0),
-    )
-    actor = nn.Sequential(
-        layer_init(nn.Linear(num_obs, 64)),
-        nn.Tanh(),
-        layer_init(nn.Linear(64, 64)),
-        nn.Tanh(),
-        layer_init(nn.Linear(64, num_actions), std=0.01),
-    )
-    return actor, critic
-
-"""def get_ovs_for_agent_standart(global_obs: Arr, agent_idx: int) -> Arr:
-    return global_obs
-
-def get_obs_for_agent_function(mode):
-    if mode == "classic-control" or mode == "atari" or mode == "mujoco":
-        return get_ovs_for_agent_standart
-    if mode == "mappo-test":
-        return get_ovs_for_agent_mappo_test
-    if mode == "soccer":
-        return get_ovs_for_agent_soccer"""
-
 # TODO: Do I need this?
-def get_actor_and_critic_classic(num_obs: int, num_actions: int):
+def get_actor_and_critic_classic(num_obs: int, num_actions: int, num_hidden_layers: int = 2):
     """
     Returns (actor, critic) in the "classic-control" case, according to diagram above.
     """
     critic = nn.Sequential(
         layer_init(nn.Linear(num_obs, 64)),
         nn.Tanh(),
-        layer_init(nn.Linear(64, 64)),
-        nn.Tanh(),
+        *sum([[layer_init(nn.Linear(64, 64)), nn.Tanh()] for _ in range(num_hidden_layers-1)], []),
         layer_init(nn.Linear(64, 1), std=1.0),
     )
     actor = nn.Sequential(
         layer_init(nn.Linear(num_obs, 64)),
         nn.Tanh(),
-        layer_init(nn.Linear(64, 64)),
-        nn.Tanh(),
+        *sum([[layer_init(nn.Linear(64, 64)), nn.Tanh()] for _ in range(num_hidden_layers-1)], []),
+        layer_init(nn.Linear(64, num_actions), std=0.01),
+    )
+    return actor, critic
+
+def get_actor_and_critic_soccer(num_obs: int, num_actions: int, num_hidden_layers: int = 3):
+    """
+    Returns (actor, critic) in the "classic-control" case, according to diagram above.
+    """
+    critic = nn.Sequential(
+        layer_init(nn.Linear(num_obs, 64)),
+        nn.GELU(),
+        *sum([[layer_init(nn.Linear(64, 64)), nn.GELU()] for _ in range(num_hidden_layers-1)], []),
+        layer_init(nn.Linear(64, 1), std=1.0),
+    )
+    actor = nn.Sequential(
+        layer_init(nn.Linear(num_obs, 64)),
+        nn.GELU(),
+        *sum([[layer_init(nn.Linear(64, 64)), nn.GELU()] for _ in range(num_hidden_layers-1)], []),
         layer_init(nn.Linear(64, num_actions), std=0.01),
     )
     return actor, critic
@@ -461,7 +445,7 @@ def get_team_rewards(reward: Float[Arr, "num_envs"], infos: dict, num_agents: in
     if num_agents == 2:
         if "final_info" in infos:
             assert "other_reward" in infos["final_info"][0]
-            other_reward = np.array([info["other_reward"] for info in infos["final_info"]])
+            other_reward = np.array([info["other_reward"] for info in infos["final_info"]])[:, None]
         else:
             assert "other_reward" in infos
             other_reward = infos["other_reward"][:, None]
@@ -501,6 +485,8 @@ class PPOAgents:
         
         # Original line that causes the error
         self.next_obs = t.tensor(envs.reset()[0], device=device, dtype=t.float)  # need starting obs (in tensor form)
+        if self.num_agents == 1:
+            self.next_obs = self.next_obs.unsqueeze(dim=1)
         self.next_terminated = t.zeros((envs.num_envs, self.num_agents), device=device, dtype=t.bool)  # need starting termination=False
 
     def play_step(self) -> list[dict]:
@@ -511,8 +497,6 @@ class PPOAgents:
         """
         # Get newest observations (i.e. where we're starting from)
         obs_global = self.next_obs
-        if self.num_agents == 1:
-            obs_global = obs_global.unsqueeze(dim=1)
         terminated = self.next_terminated
 
         # Compute logits based on newest observation, and use it to get an action distribution we sample from
@@ -580,6 +564,8 @@ class PPOAgents:
 
         # Set next observation & termination state
         self.next_obs = t.from_numpy(next_obs_global).to(device, dtype=t.float)
+        if self.num_agents == 1:
+            self.next_obs = self.next_obs.unsqueeze(dim=1)
         self.next_terminated = t.from_numpy(next_terminated).to(device, dtype=t.float)
 
         self.step += self.envs.num_envs * self.num_agents
@@ -946,180 +932,45 @@ def test_mappo_selfplay():
     expected_value = t.tensor([[1.0]]).to(device)
     t.testing.assert_close(value, expected_value, atol=5 * 1e-2, rtol=0)
 
-# if MAIN:
+"""# if MAIN:
 #     for probe_idx in range(1, 6):
 #         test_probe(probe_idx)
 
-# if MAIN:
-#     test_mappo()
+if MAIN:
+    test_mappo()
 
-# if MAIN:
-#     test_mappo_selfplay()
+if MAIN:
+    test_mappo_selfplay()"""
 
 gym.envs.registration.register(id="Soccer-v0", entry_point=Soccer, apply_api_compatibility=False)
 if MAIN:
-    args = PPOArgs(
+    '''args = PPOArgs(
         env_id="Soccer-v0",
         mode="soccer",
         use_wandb=False,
+        video_log_freq=1000,
+        num_envs=4,
+        num_agents=4,
+        num_teams=2,
+        total_timesteps=20_000_000,
+    )
+    trainer = PPOTrainer(args)
+    trainer.train()'''
+    args = PPOArgs(
+        env_id="Soccer-v0",
+        mode="soccer",
+        use_wandb=True,
         video_log_freq=50,
         num_envs=4,
         num_agents=4,
         num_teams=2,
+        total_timesteps=8_000_000,
+        num_steps_per_rollout = 4096,
+        num_minibatches = 16,
+        batches_per_learning_phase = 4,
     )
     trainer = PPOTrainer(args)
     trainer.train()
-
-# %%
-if MAIN:
-    args = PPOArgs(use_wandb=True, video_log_freq=50)
-    trainer = PPOTrainer(args)
-    trainer.train()
-
-
-# %%
-from gymnasium.envs.classic_control import CartPoleEnv
-
-
-class EasyCart(CartPoleEnv):
-    def step(self, action):
-        obs, reward, terminated, truncated, info = super().step(action)
-
-        x, v, theta, omega = obs
-
-        # First reward: angle should be close to zero
-        reward_1 = 1 - abs(theta / 0.2095)
-        # Second reward: position should be close to the center
-        reward_2 = 1 - abs(x / 2.4)
-
-        # Combine both rewards (keep it in the [0, 1] range)
-        reward_new = (reward_1 + reward_2) / 2
-
-        return obs, reward_new, terminated, truncated, info
-
-
-if MAIN:
-    gym.envs.registration.register(id="EasyCart-v0", entry_point=EasyCart, max_episode_steps=500)
-    args = PPOArgs(env_id="EasyCart-v0", use_wandb=True, video_log_freq=50)
-    trainer = PPOTrainer(args)
-    trainer.train()
-
-
-# %%
-class SpinCart(CartPoleEnv):
-    def step(self, action):
-        obs, reward, terminated, truncated, info = super().step(action)
-
-        x, v, theta, omega = obs
-
-        # Allow for 360-degree rotation (but keep the cart on-screen)
-        terminated = abs(x) > self.x_threshold
-
-        # Reward function incentivises fast spinning while staying still & near centre
-        rotation_speed_reward = min(1, 0.1 * abs(omega))
-        stability_penalty = max(1, abs(x / 2.5) + abs(v / 10))
-        reward_new = rotation_speed_reward - 0.5 * stability_penalty
-
-        return (obs, reward_new, terminated, truncated, info)
-
-if MAIN:
-    gym.envs.registration.register(id="SpinCart-v0", entry_point=SpinCart, max_episode_steps=500)
-    args = PPOArgs(env_id="SpinCart-v0", use_wandb=True, video_log_freq=50)
-    trainer = PPOTrainer(args)
-    trainer.train()
-
-
-# %%
-if MAIN:
-    env = gym.make("ALE/Breakout-v5", render_mode="rgb_array")
-
-    print(env.action_space)  # Discrete(4): 4 actions to choose from
-    print(env.observation_space)  # Box(0, 255, (210, 160, 3), uint8): an RGB image of the game screen
-
-
-if MAIN:
-    print(env.get_action_meanings())
-
-
-# %%
-def display_frames(frames: Int[Arr, "timesteps height width channels"], figsize=(4, 5)):
-    fig, ax = plt.subplots(figsize=figsize)
-    im = ax.imshow(frames[0])
-    plt.close()
-
-    def update(frame):
-        im.set_array(frame)
-        return [im]
-
-    ani = FuncAnimation(fig, update, frames=frames, interval=100)
-    display(HTML(ani.to_jshtml()))
-
-
-if MAIN:
-    nsteps = 150
-
-    frames = []
-    obs, info = env.reset()
-    for _ in tqdm(range(nsteps)):
-        action = env.action_space.sample()
-        obs, reward, terminated, truncated, info = env.step(action)
-        frames.append(obs)
-
-    display_frames(np.stack(frames))
-
-
-# %%
-if MAIN:
-    env_wrapped = prepare_atari_env(env)
-
-    frames = []
-    obs, info = env_wrapped.reset()
-    for _ in tqdm(range(nsteps)):
-        action = env_wrapped.action_space.sample()
-        obs, reward, terminated, truncated, info = env_wrapped.step(action)
-        obs = einops.repeat(np.array(obs), "frames h w -> h (frames w) 3")  # stack frames across the row
-        frames.append(obs)
-
-    display_frames(np.stack(frames), figsize=(12, 3))
-
-
-def get_actor_and_critic_atari(obs_shape: tuple[int,], num_actions: int) -> tuple[nn.Sequential, nn.Sequential]:
-    """
-    Returns (actor, critic) in the "atari" case, according to diagram above.
-    """
-    assert obs_shape[-1] % 8 == 4
-
-    L_after_convolutions = (obs_shape[-1] // 8) - 3
-    in_features = 64 * L_after_convolutions * L_after_convolutions
-
-    hidden = nn.Sequential(
-        layer_init(nn.Conv2d(4, 32, 8, stride=4, padding=0)),
-        nn.ReLU(),
-        layer_init(nn.Conv2d(32, 64, 4, stride=2, padding=0)),
-        nn.ReLU(),
-        layer_init(nn.Conv2d(64, 64, 3, stride=1, padding=0)),
-        nn.ReLU(),
-        nn.Flatten(),
-        layer_init(nn.Linear(in_features, 512)),
-        nn.ReLU(),
-    )
-
-    actor = nn.Sequential(hidden, layer_init(nn.Linear(512, num_actions), std=0.01))
-    critic = nn.Sequential(hidden, layer_init(nn.Linear(512, 1), std=1))
-
-    return actor, critic
-
-
-# %%
-if MAIN:
-    args = PPOArgs(
-        env_id="ALE/Breakout-v5",
-        wandb_project_name="PPOAtari",
-        use_wandb=True,
-        mode="atari",
-        clip_coef=0.1,
-        num_envs=8,
-        video_log_freq=25,
-    )
-    trainer = PPOTrainer(args)
-    trainer.train()
+    # save trainer with pickle
+    with open("soccer_trainer.pkl", "wb") as f:
+        pickle.dump(trainer, f)
