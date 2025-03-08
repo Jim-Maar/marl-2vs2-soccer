@@ -297,7 +297,7 @@ class Soccer(gym.Env):
         
     def get_global_velocity(self, vel, agent_id):
         return self.get_local_velocity(vel, agent_id) # works because function is s
-    
+
     def get_observations(self):
         """Get observations for all agents"""
         observations = []
@@ -314,11 +314,11 @@ class Soccer(gym.Env):
             
             # Add own position and velocity (local coordinates)
             own_pos = self.get_local_position(
-                (self.players[i].position.x, self.players[i].position.y), 
+                (self.players[i].position.x / GAME_WIDTH, self.players[i].position.y / GAME_HEIGHT), 
                 i
             )
             own_vel = self.get_local_velocity(
-                (self.players[i].linearVelocity.x, self.players[i].linearVelocity.y),
+                (self.players[i].linearVelocity.x / REAKISTIC_MAXIMUM_VELOCITY, self.players[i].linearVelocity.y / REAKISTIC_MAXIMUM_VELOCITY),
                 i
             )
             agent_observation.extend(own_pos)
@@ -327,11 +327,11 @@ class Soccer(gym.Env):
             # Add teammate positions and velocities (local coordinates)
             for j in teammate_indices:
                 teammate_pos = self.get_local_position(
-                    (self.players[j].position.x, self.players[j].position.y),
+                    (self.players[j].position.x / GAME_WIDTH, self.players[j].position.y / GAME_HEIGHT),
                     i
                 )
                 teammate_vel = self.get_local_velocity(
-                    (self.players[j].linearVelocity.x, self.players[j].linearVelocity.y),
+                    (self.players[j].linearVelocity.x / REAKISTIC_MAXIMUM_VELOCITY, self.players[j].linearVelocity.y / REAKISTIC_MAXIMUM_VELOCITY),
                     i
                 )
                 agent_observation.extend(teammate_pos)
@@ -340,11 +340,11 @@ class Soccer(gym.Env):
             # Add enemy positions and velocities (local coordinates)
             for j in enemy_indices:
                 enemy_pos = self.get_local_position(
-                    (self.players[j].position.x, self.players[j].position.y),
+                    (self.players[j].position.x / GAME_WIDTH, self.players[j].position.y / GAME_HEIGHT),
                     i
                 )
                 enemy_vel = self.get_local_velocity(
-                    (self.players[j].linearVelocity.x, self.players[j].linearVelocity.y),
+                    (self.players[j].linearVelocity.x / REAKISTIC_MAXIMUM_VELOCITY, self.players[j].linearVelocity.y / REAKISTIC_MAXIMUM_VELOCITY),
                     i
                 )
                 agent_observation.extend(enemy_pos)
@@ -352,11 +352,11 @@ class Soccer(gym.Env):
             
             # Add ball position and velocity (local coordinates)
             ball_pos = self.get_local_position(
-                (self.ball.position.x, self.ball.position.y),
+                (self.ball.position.x / GAME_WIDTH, self.ball.position.y / GAME_HEIGHT),
                 i
             )
             ball_vel = self.get_local_velocity(
-                (self.ball.linearVelocity.x, self.ball.linearVelocity.y),
+                (self.ball.linearVelocity.x / REAKISTIC_MAXIMUM_VELOCITY, self.ball.linearVelocity.y / REAKISTIC_MAXIMUM_VELOCITY),
                 i
             )
             agent_observation.extend(ball_pos)
