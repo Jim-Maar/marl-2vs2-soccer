@@ -53,7 +53,7 @@ MAIN = __name__ == "__main__" or is_debugging
 
 MODES = ["classic-control", "atari", "mujoco", "mappo-test", "soccer"]
 
-RUN_NAME = "new_rewards_high_num_per_rollout_3_layer_GELU"
+RUN_NAME = "only_passing_and_goal_new_smoothness_stay_own_half"
 
 # %%
 @dataclass
@@ -959,15 +959,15 @@ if MAIN:
     args = PPOArgs(
         env_id="Soccer-v0",
         mode="soccer",
-        use_wandb=True,
+        use_wandb=False,
         video_log_freq=50,
         num_envs=4,
         num_agents=4,
         num_teams=2,
         total_timesteps=8_000_000,
-        num_steps_per_rollout = 4096,
+        num_steps_per_rollout = 1024,
         num_minibatches = 16,
-        batches_per_learning_phase = 4,
+        batches_per_learning_phase = 2,
     )
     trainer = PPOTrainer(args)
     trainer.train()

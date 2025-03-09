@@ -69,6 +69,42 @@ LEFT = 6
 UP_LEFT = 7
 NO_OP = 8
 
+SIMILAR_ACTION_PAIRS = [
+    (UP, UP_RIGHT),
+    (UP, UP_LEFT),
+    (DOWN, DOWN_RIGHT),
+    (DOWN, DOWN_LEFT),
+    (RIGHT, UP_RIGHT),
+    (RIGHT, DOWN_RIGHT),
+    (LEFT, UP_LEFT),
+    (LEFT, DOWN_LEFT),
+]
+
+DEFAULT_REWARD_SPECIFICATION = {
+    "goal": 10.0,
+    "stay_in_field": 0.02,
+    "smoothness": 0.05,
+    "stay_own_half": 0.02,
+    "winning_the_ball_and_passing": 1.5,
+}
+
+'''DEBUG_REWARD_SPECIFICATION = {
+    "goal": 10.0,
+    "winning_the_ball_and_passing": 1.0,
+    "stay_in_field": 0.05,
+    "smoothness": 0.05,
+    "dist_to_ball": 0.05,
+    "dist_to_goal": 0.05,
+    "velocity_to_goal": 0.05,
+    "velocity_to_ball": 0.05,
+    "stay_own_half": 0.05,
+}'''
+
+DEBUG_REWARD_SPECIFICATION = {
+    "dist_to_ball": 1.0,
+}
+# DEFAULT_REWARD_SPECIFICATION = DEBUG_REWARD_SPECIFICATION
+
 class SoccerContactListener(Box2D.b2ContactListener):
     def __init__(self, env):
         Box2D.b2ContactListener.__init__(self)
@@ -84,12 +120,12 @@ class SoccerContactListener(Box2D.b2ContactListener):
             if body_a.userData.get('type') == 'ball' and 'team' in body_b.userData:
                 # body_a is ball, body_b is player
                 self.env.ball_touched[body_b.userData['team']] = True
-                self.env.last_ball_toucher = body_b.userData['id']
+                self.env.ball_toucher = body_b.userData['id']
             elif body_b.userData.get('type') == 'ball' and 'team' in body_a.userData:
                 # body_b is ball, body_a is player
                 self.env.ball_touched[body_a.userData['team']] = True
-                self.env.last_ball_toucher = body_a.userData['id']
-    
+                self.env.ball_toucher = body_a.userData['id']
+
     def EndContact(self, contact):
         pass
     
@@ -102,7 +138,7 @@ class SoccerContactListener(Box2D.b2ContactListener):
 class Soccer(gym.Env):
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": FPS}
     
-    def __init__(self, render_mode=None, video_log_freq=100, env_id="Soccer-v0", seed=1, shared_reward=True):
+    def __init__(self, render_mode=None, video_log_freq=100, env_id="Soccer-v0", seed=1, reward_specification=DEFAULT_REWARD_SPECIFICATION):
         super().__init__()
         
         # Environment parameters
@@ -114,8 +150,9 @@ class Soccer(gym.Env):
         self.render_mode = render_mode
         self.env_id = env_id
         self.seed = seed
-        self.shared_reward = shared_reward
-        
+        self.reward_specification = reward_specification
+        self.local_position_history = []
+
         # Observation and action spaces
         # Each agent observes: 
         # - own position (2) and velocity (2)
@@ -154,6 +191,21 @@ class Soccer(gym.Env):
         
         # Reset to initialize everything
         self.reset()
+
+    def add_to_ball_toucher_history(self, agent_idx):
+        self.ball_toucher_history.append(agent_idx)
+        if len(self.ball_toucher_history) > 3:
+            self.ball_toucher_history.pop(0)
+
+    def add_to_action_history(self, actions):
+        self.action_history.append(actions)
+        if len(self.action_history) > 3:
+            self.action_history.pop(0)
+
+    def add_to_local_position_history(self, local_position):
+        self.local_position_history.append(local_position)
+        if len(self.local_position_history) > 3:
+            self.local_position_history.pop(0)
     
     def create_boundaries(self):
         # Create walls and goals
@@ -239,15 +291,16 @@ class Soccer(gym.Env):
             ),
         )
         self.ball.userData = {"type": "ball"}
-        self.ball_touched = [False for _ in range(self.num_teams)]
-        self.last_ball_toucher = None
+        self.reset_ball()
     
     def reset_ball(self):
         self.ball.position = (GAME_WIDTH/2, GAME_HEIGHT/2)
         self.ball.linearVelocity = (0, 0)
         self.ball.angularVelocity = 0
         self.ball_touched = [False for _ in range(self.num_teams)]
-        self.last_ball_toucher = None
+        self.last_ball_toucher = None # last agent that touched the ball, isnt reset when noone touches it
+        self.ball_toucher_history = [] # history of agents that touched the ball, noone is None
+        self.ball_toucher = None # last agent that touched the ball, is reset when noone touches it
     
     def check_goal(self):
         ball_pos = self.ball.position
@@ -259,7 +312,7 @@ class Soccer(gym.Env):
             return 0  # Team 1 scored
         return -1  # No goal
     
-    def get_local_position(self, pos, agent_id):
+    def get_local_position(self, pos, agent_id, normalize=False):
         """Convert global position to local position for the given agent"""
         # For soccer, we'll define local coordinates as:
         # Team 1 (bottom): y-axis points up
@@ -268,32 +321,38 @@ class Soccer(gym.Env):
         # Right players: x-axis points left
         
         x, y = pos
-        
         # Team 1 (bottom)
         if agent_id == 0:  # Bottom left
-            return np.array([x, y])
+            new_pos = np.array([x, y])
         elif agent_id == 1:  # Bottom right
-            return np.array([GAME_WIDTH - x, y])
+            new_pos = np.array([GAME_WIDTH - x, y])
         # Team 2 (top)
         elif agent_id == 2:  # Top left
-            return np.array([x, GAME_HEIGHT - y])
+            new_pos = np.array([x, GAME_HEIGHT - y])
         elif agent_id == 3:  # Top right
-            return np.array([GAME_WIDTH - x, GAME_HEIGHT - y])
+            new_pos = np.array([GAME_WIDTH - x, GAME_HEIGHT - y])
+        if normalize:
+            new_pos[0] = new_pos[0] / GAME_WIDTH
+            new_pos[1] = new_pos[1] / GAME_HEIGHT
+        return new_pos
     
-    def get_local_velocity(self, vel, agent_id):
+    def get_local_velocity(self, vel, agent_id, normalize=False):
         """Convert global velocity to local velocity for the given agent"""
         vx, vy = vel
         
         # Team 1 (bottom)
         if agent_id == 0:  # Bottom left
-            return np.array([vx, vy])
+            new_vel = np.array([vx, vy])
         elif agent_id == 1:  # Bottom right
-            return np.array([-vx, vy])
+            new_vel = np.array([-vx, vy])
         # Team 2 (top)
         elif agent_id == 2:  # Top left
-            return np.array([vx, -vy])
+            new_vel = np.array([vx, -vy])
         elif agent_id == 3:  # Top right
-            return np.array([-vx, -vy])
+            new_vel = np.array([-vx, -vy])
+        if normalize:
+            new_vel = new_vel / REAKISTIC_MAXIMUM_VELOCITY
+        return new_vel
         
     def get_global_velocity(self, vel, agent_id):
         return self.get_local_velocity(vel, agent_id) # works because function is s
@@ -314,12 +373,14 @@ class Soccer(gym.Env):
             
             # Add own position and velocity (local coordinates)
             own_pos = self.get_local_position(
-                (self.players[i].position.x / GAME_WIDTH, self.players[i].position.y / GAME_HEIGHT), 
-                i
+                (self.players[i].position.x, self.players[i].position.y), 
+                i,
+                normalize=True
             )
             own_vel = self.get_local_velocity(
-                (self.players[i].linearVelocity.x / REAKISTIC_MAXIMUM_VELOCITY, self.players[i].linearVelocity.y / REAKISTIC_MAXIMUM_VELOCITY),
-                i
+                (self.players[i].linearVelocity.x, self.players[i].linearVelocity.y),
+                i,
+                normalize=True
             )
             agent_observation.extend(own_pos)
             agent_observation.extend(own_vel)
@@ -327,12 +388,14 @@ class Soccer(gym.Env):
             # Add teammate positions and velocities (local coordinates)
             for j in teammate_indices:
                 teammate_pos = self.get_local_position(
-                    (self.players[j].position.x / GAME_WIDTH, self.players[j].position.y / GAME_HEIGHT),
-                    i
+                    (self.players[j].position.x, self.players[j].position.y),
+                    i,
+                    normalize=True
                 )
                 teammate_vel = self.get_local_velocity(
-                    (self.players[j].linearVelocity.x / REAKISTIC_MAXIMUM_VELOCITY, self.players[j].linearVelocity.y / REAKISTIC_MAXIMUM_VELOCITY),
-                    i
+                    (self.players[j].linearVelocity.x, self.players[j].linearVelocity.y),
+                    i,
+                    normalize=True
                 )
                 agent_observation.extend(teammate_pos)
                 agent_observation.extend(teammate_vel)
@@ -340,24 +403,28 @@ class Soccer(gym.Env):
             # Add enemy positions and velocities (local coordinates)
             for j in enemy_indices:
                 enemy_pos = self.get_local_position(
-                    (self.players[j].position.x / GAME_WIDTH, self.players[j].position.y / GAME_HEIGHT),
-                    i
+                    (self.players[j].position.x, self.players[j].position.y),
+                    i,
+                    normalize=True
                 )
                 enemy_vel = self.get_local_velocity(
-                    (self.players[j].linearVelocity.x / REAKISTIC_MAXIMUM_VELOCITY, self.players[j].linearVelocity.y / REAKISTIC_MAXIMUM_VELOCITY),
-                    i
+                    (self.players[j].linearVelocity.x, self.players[j].linearVelocity.y),
+                    i,
+                    normalize=True
                 )
                 agent_observation.extend(enemy_pos)
                 agent_observation.extend(enemy_vel)
             
             # Add ball position and velocity (local coordinates)
             ball_pos = self.get_local_position(
-                (self.ball.position.x / GAME_WIDTH, self.ball.position.y / GAME_HEIGHT),
-                i
+                (self.ball.position.x, self.ball.position.y),
+                i,
+                normalize=True
             )
             ball_vel = self.get_local_velocity(
-                (self.ball.linearVelocity.x / REAKISTIC_MAXIMUM_VELOCITY, self.ball.linearVelocity.y / REAKISTIC_MAXIMUM_VELOCITY),
-                i
+                (self.ball.linearVelocity.x, self.ball.linearVelocity.y),
+                i,
+                normalize=True
             )
             agent_observation.extend(ball_pos)
             agent_observation.extend(ball_vel)
@@ -367,179 +434,219 @@ class Soccer(gym.Env):
         
         return np.array(observations, dtype=np.float32)
     
-    def calculate_rewards(self, goal_scored):
-        """Calculate rewards for all agents"""
-        rewards = np.zeros(self.num_agents)
+    def get_goal_reward(self, goal_scored):
         team_rewards = np.zeros(self.num_teams)
-        
         if goal_scored >= 0:  # A goal was scored
             scoring_team = goal_scored
             for team in range(self.num_teams):
                 if team == scoring_team:
-                    team_rewards[team] += 10.0  # Big reward for scoring team
+                    team_rewards[team] += 1  # Big reward for scoring team
                 else:
-                    team_rewards[team] += -5.0  # Penalty for conceding team
+                    team_rewards[team] += -0.5  # Penalty for conceding team
+        return team_rewards
+    
+    def get_stay_in_field_reward(self, agent_idx):
+        """Calculate reward for staying in the field"""
+        player = self.players[agent_idx]
+        # Check if player is in the field
+        if player.position.x > 0 and player.position.x < GAME_WIDTH and \
+            player.position.y > 0 and player.position.y < GAME_HEIGHT:
+            return 1.0
         else:
-            # Calculate team-based rewards
-            for team in range(self.num_teams):
-                team_start = team * self.team_size
-                team_end = (team + 1) * self.team_size
-                
-                # Calculate average distance to ball for the team
-                avg_distance_to_ball = 0
-                avg_x_reward = 0
-                avg_y_reward = 0
-                
-                for i in range(team_start, team_end):
-                    player = self.players[i]
-                    # Calculate direction vector from player to ball
-                    direction_x = self.ball.position.x - player.position.x
-                    direction_y = self.ball.position.y - player.position.y
-                    
-                    # Calculate distance to ball
-                    distance_to_ball = np.sqrt(direction_x**2 + direction_y**2)
-                    # Normalize distance (assuming field dimensions)
-                    max_possible_distance = np.sqrt(GAME_WIDTH**2 + GAME_HEIGHT**2)
-                    normalized_distance = distance_to_ball / max_possible_distance
-                    avg_distance_to_ball += (1.0 - normalized_distance)
-                    
-                    # Get player velocity
-                    velocity_x = round(player.linearVelocity.x, 1)
-                    velocity_y = round(player.linearVelocity.y, 1)
-                    
-                    # Calculate reward for x direction
-                    if (direction_x > 0 and velocity_x > 0) or (direction_x < 0 and velocity_x < 0):
-                        # Moving in the correct x direction toward the ball
-                        avg_x_reward += 0.5
-                    
-                    # Calculate reward for y direction
-                    if (direction_y > 0 and velocity_y > 0) or (direction_y < 0 and velocity_y < 0):
-                        # Moving in the correct y direction toward the ball
-                        avg_y_reward += 0.5
-                
-                # Average the rewards across team members
-                avg_distance_to_ball /= self.team_size
-                avg_x_reward /= self.team_size
-                avg_y_reward /= self.team_size
-                
-                # Add rewards for both directions and distance
-                team_rewards[team] += 0.03 * avg_distance_to_ball + 0.02 * (avg_x_reward + avg_y_reward)
-                
-                # Target y-coordinate for the goal (middle of enemy goal)
-                target_y = GAME_HEIGHT if team == 0 else 0
-                target_x = GAME_WIDTH / 2
-                
-                # Direction vector from ball to goal
-                goal_direction_x = target_x - self.ball.position.x
-                goal_direction_y = target_y - self.ball.position.y
-                
-                # Normalize the direction vector
-                direction_magnitude = np.sqrt(goal_direction_x**2 + goal_direction_y**2)
-                
-                # Dot product of ball velocity and goal direction
-                ball_vel_x = self.ball.linearVelocity.x
-                ball_vel_y = self.ball.linearVelocity.y
-                ball_vel_magnitude = np.sqrt(ball_vel_x**2 + ball_vel_y**2)
+            return -1.0
+    
+    def are_actions_similar(self, action1, action2):
+        """Check if two actions are similar"""
+        return (action1, action2) in SIMILAR_ACTION_PAIRS or (action2, action1) in SIMILAR_ACTION_PAIRS
 
-                dot_product = (ball_vel_x * goal_direction_x + ball_vel_y * goal_direction_y) / (ball_vel_magnitude * direction_magnitude + 1e-6)
-                
-                # Normalize dot product
-                normalized_dot_product = dot_product / REAKISTIC_MAXIMUM_VELOCITY
-                
-                # Calculate distance-based reward
-                normalized_distance = 1.0 - (direction_magnitude / (GAME_HEIGHT + GAME_WIDTH/2))  # Higher when closer
-                
-                # Combine rewards with multipliers
-                velocity_reward = 0.2 * normalized_dot_product
-                distance_reward = 0.1 * normalized_distance
-                
-                # Add to team rewards
-                team_rewards[team] += velocity_reward + distance_reward
-                
-                # Subtract half from enemy team
-                enemy_team = 1 - team
-                team_rewards[enemy_team] -= (velocity_reward + distance_reward) / 2
+    def get_smoothness_reward(self, agent_idx=None):
+        """Calculate reward for smoothness of actions"""
+        '''if len(self.action_history) < 2:
+            return 0.0
+            
+        current_action = self.action_history[-1][agent_idx]
+        previous_action = self.action_history[-2][agent_idx]
+        if self.are_actions_similar(current_action, previous_action):
+            return 1.0
+        else:
+            return -1.0'''
+        if len(self.local_position_history) < 2:
+            return 0.0
+        previous_position = self.local_position_history[0][agent_idx]
+        this_position = self.local_position_history[-1][agent_idx]
+        dist = np.linalg.norm(this_position - previous_position)
+        expected_dist = PLAYER_SIZE / FPS * 3
+        if dist >= expected_dist / 2:
+            return 1.0
+        else:
+            return -1.0
         
+    def get_winning_the_ball_and_passing_reward(self):
+        """Calculate reward for winning the ball and passing"""
+        team_rewards = np.zeros(self.num_teams)
+        if self.ball_toucher is None:
+            return team_rewards
+        if len(self.ball_toucher_history) < 3: # less than 3 steps in
+            return team_rewards
+        if not (self.ball_toucher_history[-2] is None and self.ball_toucher_history[-1] is None):
+            return team_rewards
+        if self.last_ball_toucher == self.ball_toucher:
+            return team_rewards
+        for team in range(self.num_teams):
+            last_ball_toucher_team = self.last_ball_toucher // self.team_size
+            if self.ball_touched[team]:
+                team_rewards[team] += 1
+            elif last_ball_toucher_team == team:
+                team_rewards[team] += -0.5
+        return team_rewards
+
+    def get_normalized_distance(self, vector1 : Box2D.b2Vec2, vector2 : Box2D.b2Vec2, max_distance = GAME_WIDTH + GAME_HEIGHT):
+        distance = np.sqrt((vector1.x - vector2.x)**2 + (vector1.y - vector2.y)**2)
+        normalized_distance = distance / max_distance
+        return normalized_distance
+
+    def get_dist_to_ball_reward(self, agent_idx, only_beginning=True):
+        """Calculate reward for distance to ball"""
+        if only_beginning:
+            return 0.0
+        
+        normalized_distance = self.get_normalized_distance(self.players[agent_idx].position, self.ball.position)
+        return 1.0 - normalized_distance
+    
+    def get_dist_to_goal_reward(self):
+        """Calculate reward for distance to goal"""
+        team_rewards = np.zeros(self.num_teams)
+        for team in range(self.num_teams):
+            pos_of_enemy_goal = Box2D.b2Vec2(GAME_WIDTH / 2, GAME_HEIGHT if team == 0 else 0)
+            normalized_distance = self.get_normalized_distance(self.ball.position, pos_of_enemy_goal)
+            team_rewards[team] = 1.0 - normalized_distance
+        return team_rewards
+    
+    def get_normalized_dot_product(self, vector1 : Box2D.b2Vec2, vector2 : Box2D.b2Vec2, max_value):
+        vector2_magnitude = np.sqrt(vector2.x**2 + vector2.y**2)
+        dot_product = (vector1.x * vector2.x + vector1.y * vector2.y) / (vector2_magnitude + 1e-6)
+        normalized_dot_product = dot_product / max_value
+        return normalized_dot_product
+
+    def get_velocity_to_ball_reward(self, agent_idx):
+        """Calculate reward for velocity towards the ball"""
+        player = self.players[agent_idx]
+        normalized_dot_product = self.get_normalized_dot_product(player.linearVelocity, self.ball.position - player.position, REAKISTIC_MAXIMUM_VELOCITY)
+        return normalized_dot_product
+
+    def get_velocity_to_goal_reward(self):
+        """Calculate reward for velocity towards the goal"""
+        team_rewards = np.zeros(self.num_teams)
+        for team in range(self.num_teams):
+            pos_of_enemy_goal = Box2D.b2Vec2(GAME_WIDTH / 2, GAME_HEIGHT if team == 0 else 0)
+            normalized_dot_product = self.get_normalized_dot_product(self.ball.linearVelocity, pos_of_enemy_goal - self.ball.position, REAKISTIC_MAXIMUM_VELOCITY)
+            team_rewards[team] = normalized_dot_product
+        return team_rewards
+
+    def get_stay_own_half_reward(self, agent_idx):
+        """Calculate reward for staying in own half defined as the cirle with the center of the own goal is the center of the circle and the radius as the distance to the ball"""
+        player = self.players[agent_idx]
+        team = agent_idx // self.team_size
+        pos_of_own_goal = Box2D.b2Vec2(GAME_WIDTH / 2, 0 if team == 0 else GAME_HEIGHT)
+        radius = self.get_normalized_distance(pos_of_own_goal, self.ball.position, max_distance = 1)
+        dist_to_own_goal = self.get_normalized_distance(player.position, pos_of_own_goal, max_distance = 1)
+        if dist_to_own_goal < radius:
+            return 1.0
+        else:
+            return 0.0
+        
+    def calculate_rewards(self, goal_scored):
+        """Calculate rewards for all agents"""
+        rewards = np.zeros(self.num_agents)
+        team_rewards = np.zeros(self.num_teams)
+        if "goal" in self.reward_specification:
+            team_rewards += self.reward_specification["goal"] * self.get_goal_reward(goal_scored)
+        if "winning_the_ball_and_passing" in self.reward_specification:
+            team_rewards += self.reward_specification["winning_the_ball_and_passing"] * self.get_winning_the_ball_and_passing_reward()
+        if "velocity_to_goal" in self.reward_specification:
+            team_rewards += self.reward_specification["velocity_to_goal"] * self.get_velocity_to_goal_reward()
+        if "dist_to_goal" in self.reward_specification:
+            team_rewards += self.reward_specification["dist_to_goal"] * self.get_dist_to_goal_reward()
+        # calculate rewards
+        for team_idx in range(self.num_teams):
+            team_start = team_idx * self.team_size
+            team_end = (team_idx + 1) * self.team_size
+            for agent_idx in range(team_start, team_end):
+                if "stay_in_field" in self.reward_specification:
+                    team_rewards[team_idx] += 1/self.team_size * self.reward_specification["stay_in_field"] * self.get_stay_in_field_reward(agent_idx)
+                if "smoothness" in self.reward_specification:
+                    team_rewards[team_idx] += 1/self.team_size * self.reward_specification["smoothness"] * self.get_smoothness_reward(agent_idx)
+                if "velocity_to_ball" in self.reward_specification:
+                    team_rewards[team_idx] += 1/self.team_size * self.reward_specification["velocity_to_ball"] * self.get_velocity_to_ball_reward(agent_idx)
+                # Some rewards should only be calculated for one player
+                if "dist_to_ball" in self.reward_specification:
+                    team_rewards[team_idx] = max(team_rewards[team_idx], self.reward_specification["dist_to_ball"] * self.get_dist_to_ball_reward(agent_idx))
+                if "stay_own_half" in self.reward_specification:
+                    team_rewards[team_idx] = max(team_rewards[team_idx], self.reward_specification["stay_own_half"] * self.get_stay_own_half_reward(agent_idx))
         # Distribute team rewards to individual agents
         # Currently the reward needs to be the same for all agents in a tean!!!
         for i in range(self.num_agents):
             team = i // self.team_size
             rewards[i] = team_rewards[team]
-
-        """for team in range(self.num_teams):
-            team_start = team * self.team_size
-            team_end = (team + 1) * self.team_size
-            
-            # Target y-coordinate for the goal
-            target_y = GAME_HEIGHT if team == 0 else 0
-            
-            if self.ball_touched[team]:
-                # Reward based on ball distance to opponent's goal
-                normalized_ball_distance = abs(self.ball.position.y - target_y) / GAME_HEIGHT
-                team_reward = 0.05 + 0.1 * (1.0 - normalized_ball_distance)  # Higher reward when ball is closer to goal
-                for i in range(team_start, team_end):
-                    rewards[i] = team_reward
-            else:
-                # Reward based on closest player distance to ball
-                min_distance = float('inf')
-                for i in range(team_start, team_end):
-                    player = self.players[i]
-                    distance = np.sqrt(
-                        (player.position.x - self.ball.position.x)**2 + 
-                        (player.position.y - self.ball.position.y)**2
-                    )
-                    if not self.shared_reward:
-                        normalized_distance = distance / (np.sqrt(GAME_WIDTH**2 + GAME_HEIGHT**2))
-                        rewards[i] = 0.05 * (1.0 - normalized_distance)
-                    else:
-                        min_distance = min(min_distance, distance)
-                
-                if self.shared_reward:
-                    # Normalize distance and convert to reward
-                    normalized_distance = min_distance / (np.sqrt(GAME_WIDTH**2 + GAME_HEIGHT**2))
-                    team_reward = 0.05 * (1.0 - normalized_distance)  # Higher reward when player is closer to ball
-                    # Assign the same reward to all team members
-                    for i in range(team_start, team_end):
-                        rewards[i] = team_reward"""
-        
         return rewards
     
+    def process_action_to_velocity(self, action):
+        """Convert action to local velocity vector"""
+        local_vel = [0.0, 0.0]
+        
+        # Calculate velocity based on action
+        if action == UP:
+            local_vel[1] = PLAYER_SPEED
+        elif action == UP_RIGHT:
+            local_vel[0] = PLAYER_SPEED * 0.7071  # 1/sqrt(2) for diagonal movement
+            local_vel[1] = PLAYER_SPEED * 0.7071
+        elif action == RIGHT:
+            local_vel[0] = PLAYER_SPEED
+        elif action == DOWN_RIGHT:
+            local_vel[0] = PLAYER_SPEED * 0.7071
+            local_vel[1] = -PLAYER_SPEED * 0.7071
+        elif action == DOWN:
+            local_vel[1] = -PLAYER_SPEED
+        elif action == DOWN_LEFT:
+            local_vel[0] = -PLAYER_SPEED * 0.7071
+            local_vel[1] = -PLAYER_SPEED * 0.7071
+        elif action == LEFT:
+            local_vel[0] = -PLAYER_SPEED
+        elif action == UP_LEFT:
+            local_vel[0] = -PLAYER_SPEED * 0.7071
+            local_vel[1] = PLAYER_SPEED * 0.7071
+        # NO_OP: vel remains (0, 0)
+        
+        return local_vel
+
     def step(self, actions):
         """Take a step in the environment with the given actions"""
+
+        self.add_to_action_history(actions)
+
         # Process actions for each agent
         for i, action in enumerate(actions):
             player = self.players[i]
-            local_vel = [0.0, 0.0]
-            
-            # Calculate velocity based on action
-            if action == UP:
-                local_vel[1] = PLAYER_SPEED
-            elif action == UP_RIGHT:
-                local_vel[0] = PLAYER_SPEED * 0.7071  # 1/sqrt(2) for diagonal movement
-                local_vel[1] = PLAYER_SPEED * 0.7071
-            elif action == RIGHT:
-                local_vel[0] = PLAYER_SPEED
-            elif action == DOWN_RIGHT:
-                local_vel[0] = PLAYER_SPEED * 0.7071
-                local_vel[1] = -PLAYER_SPEED * 0.7071
-            elif action == DOWN:
-                local_vel[1] = -PLAYER_SPEED
-            elif action == DOWN_LEFT:
-                local_vel[0] = -PLAYER_SPEED * 0.7071
-                local_vel[1] = -PLAYER_SPEED * 0.7071
-            elif action == LEFT:
-                local_vel[0] = -PLAYER_SPEED
-            elif action == UP_LEFT:
-                local_vel[0] = -PLAYER_SPEED * 0.7071
-                local_vel[1] = PLAYER_SPEED * 0.7071
-            # NO_OP: vel remains (0, 0)
-
+            local_vel = self.process_action_to_velocity(action)
             global_vel = self.get_global_velocity(local_vel, i)
             player.linearVelocity = Box2D.b2Vec2(global_vel[0], global_vel[1])
         
+        if self.ball_toucher is not None:
+            self.last_ball_toucher = self.ball_toucher
+        self.ball_toucher = None
+
         # Update physics
         self.world.Step(1.0/FPS, 6, 2)
-        
+
+        self.add_to_ball_toucher_history(self.ball_toucher)
+        local_position = np.array([
+            self.get_local_position(
+                (self.players[i].position.x, self.players[i].position.y),
+                i,
+                normalize=False
+            ) for i in range(self.num_agents)
+        ])
+        self.add_to_local_position_history(local_position)
         # Check for goals
         goal_scored = self.check_goal()
         
@@ -571,6 +678,7 @@ class Soccer(gym.Env):
     def reset(self, seed=None, options=None):
         """Reset the environment"""
         super().reset(seed=seed)
+        self.action_history = []
         
         # Clear the world
         for body in self.world.bodies:
