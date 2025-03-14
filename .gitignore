@@ -1,6 +1,7 @@
 .env
 ppo/__pycache__
 ppo/environments/__pycache__
+ppo/checkpoints
 ppo/videos
 wandb
 ppo/wandb

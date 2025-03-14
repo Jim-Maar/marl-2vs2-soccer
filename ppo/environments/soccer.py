@@ -81,11 +81,20 @@ SIMILAR_ACTION_PAIRS = [
 ]
 
 DEFAULT_REWARD_SPECIFICATION = {
-    "goal": 10.0,
-    "stay_in_field": 0.02,
+    "goal": 500.0,
+    "first_touch": 50.0,
+    "winning_the_ball_and_passing": 10.0,
+    # "ball_touched_at_all" : 0.05,
     "smoothness": 0.05,
+    "stay_in_field": 0.02,
     "stay_own_half": 0.02,
-    "winning_the_ball_and_passing": 1.5,
+    # "velocity_to_goal": 0.005,
+    # "dist_to_goal": 0.0025,
+}
+
+WALK_TO_BALL_SPECIFICATION = {
+    # "dist_to_ball": 0.05,
+    "velocity_to_ball": 1.0,
 }
 
 '''DEBUG_REWARD_SPECIFICATION = {
@@ -100,10 +109,11 @@ DEFAULT_REWARD_SPECIFICATION = {
     "stay_own_half": 0.05,
 }'''
 
-DEBUG_REWARD_SPECIFICATION = {
-    "dist_to_ball": 1.0,
-}
+# DEBUG_REWARD_SPECIFICATION = {
+#     "dist_to_ball": 1.0,
+# }
 # DEFAULT_REWARD_SPECIFICATION = DEBUG_REWARD_SPECIFICATION
+# DEFAULT_REWARD_SPECIFICATION = WALK_TO_BALL_SPECIFICATION
 
 class SoccerContactListener(Box2D.b2ContactListener):
     def __init__(self, env):
@@ -152,6 +162,7 @@ class Soccer(gym.Env):
         self.seed = seed
         self.reward_specification = reward_specification
         self.local_position_history = []
+        self.first_touch_happened = False
 
         # Observation and action spaces
         # Each agent observes: 
@@ -442,7 +453,7 @@ class Soccer(gym.Env):
                 if team == scoring_team:
                     team_rewards[team] += 1  # Big reward for scoring team
                 else:
-                    team_rewards[team] += -0.5  # Penalty for conceding team
+                    team_rewards[team] += -0.25  # Penalty for conceding team
         return team_rewards
     
     def get_stay_in_field_reward(self, agent_idx):
@@ -554,6 +565,20 @@ class Soccer(gym.Env):
             return 1.0
         else:
             return 0.0
+
+    def get_first_touch_reward(self):
+        """Calculate reward for first touch"""
+        team_rewards = np.zeros(self.num_teams)
+        if self.first_touch_happened:
+            return team_rewards
+        if self.ball.last_ball_toucher is None:
+            return team_rewards
+        first_touch_team = self.ball.last_ball_toucher // self.team_size
+        other_team = 1 - first_touch_team
+        team_rewards[first_touch_team] = 1.0
+        team_rewards[other_team] = -0.5
+        self.first_touch_happened = True
+        return team_rewards
         
     def calculate_rewards(self, goal_scored):
         """Calculate rewards for all agents"""
@@ -567,6 +592,8 @@ class Soccer(gym.Env):
             team_rewards += self.reward_specification["velocity_to_goal"] * self.get_velocity_to_goal_reward()
         if "dist_to_goal" in self.reward_specification:
             team_rewards += self.reward_specification["dist_to_goal"] * self.get_dist_to_goal_reward()
+        if "first_touch" in self.reward_specification:
+            team_rewards += self.reward_specification["first_touch"] * self.get_first_touch_reward()
         # calculate rewards
         for team_idx in range(self.num_teams):
             team_start = team_idx * self.team_size
