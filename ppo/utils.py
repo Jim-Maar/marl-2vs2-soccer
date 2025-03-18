@@ -184,6 +184,7 @@ def make_env(
     mode: str = "classic-control",
     video_log_freq: int = None,
     video_save_path: str = None,
+    reward_specification: dict | None = None,
     **kwargs,
 ):
     """
@@ -191,7 +192,10 @@ def make_env(
     """
 
     def thunk():
-        env = gym.make(env_id, render_mode="rgb_array")
+        if mode == "soccer":
+            env = gym.make(env_id, render_mode="rgb_array", reward_specification=reward_specification)
+        else:
+            env = gym.make(env_id, render_mode="rgb_array")
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if idx == 0 and video_log_freq:
             env = gym.wrappers.RecordVideo(

@@ -54,9 +54,74 @@ MAIN = __name__ == "__main__" or is_debugging
 
 MODES = ["classic-control", "atari", "mujoco", "mappo-test", "soccer"]
 
-
-
 RUN_NAME = "Real_Run"
+
+STAMDART_REWARD_SPECIFICATION = {
+    "goal": 200.0,
+    "smoothness": 0.05,
+    "stay_in_field": 0.05,
+    "stay_own_half": 0.05,
+    "base_negative": -0.15,
+}
+
+DIST_REWARD_SPECIFICATION = {
+    "goal": 200.0,
+    "player_distance": -0.05,
+    "smoothness": 0.05,
+    "stay_in_field": 0.05,
+    "stay_own_half": 0.05,
+    "base_negative": -0.15,
+}
+
+DIST_AND_PASSING_REWARD_SPECIFICATION = {
+    "goal": 200.0,
+    "distance_based_passing": 1.0,
+    "player_distance": -0.05,
+    "smoothness": 0.05,
+    "stay_in_field": 0.05,
+    "stay_own_half": 0.05,
+    "base_negative": -0.15,
+}
+
+DIST_AND_PASSING_REWARD_SPECIFICATION_2 = {
+    "goal": 100.0,
+    "distance_based_passing": 4.0,
+    "player_distance": -0.05,
+    "smoothness": 0.05,
+    "stay_in_field": 0.1,
+    "stay_own_half": 0.05,
+    "base_negative": -0.25,
+}
+
+DIST_AND_PASSING_REWARD_SPECIFICATION_3 = {
+    "goal": 100.0,
+    "distance_based_passing": 2.0,
+    "player_distance": -0.05,
+    "smoothness": 0.05,
+    "stay_in_field": 0.1,
+    "stay_own_half": 0.05,
+    "base_negative": -0.25,
+}
+
+DIST_AND_PASSING_AND_SHOOTING_REWARD_SPECIFICATION = {
+    "goal": 200.0,
+    "distance_based_passing": 2.0,
+    "shooting": 0.075,
+    "player_distance": -0.05,
+    "smoothness": 0.05,
+    "stay_in_field": 0.05,
+    "stay_own_half": 0.05,
+    "base_negative": -0.15,
+}
+
+REWARD_SPECIFICATIONS = {
+    "standard": STAMDART_REWARD_SPECIFICATION,
+    "dist": DIST_REWARD_SPECIFICATION,
+    "dist_and_passing": DIST_AND_PASSING_REWARD_SPECIFICATION,
+    "dist_and_passing_2": DIST_AND_PASSING_REWARD_SPECIFICATION_2,
+    "dist_and_passing_3": DIST_AND_PASSING_REWARD_SPECIFICATION_3,
+    "dist_and_passing_and_shooting": DIST_AND_PASSING_AND_SHOOTING_REWARD_SPECIFICATION,
+}
 
 # %%
 @dataclass
@@ -102,6 +167,9 @@ class PPOArgs:
     num_of_self_play_envs: int = 2
     expected_num_steps_per_team: int = 400 # 1200 * 4
     num_envs_per_team: int = 1
+
+    # soccer speficic
+    reward_specification: dict | None = None
 
     def __post_init__(self):
         self.batch_size = self.num_steps_per_rollout * (self.num_envs + self.num_of_self_play_envs) * self.team_size
@@ -547,14 +615,14 @@ class PPOPopulation:
         # get actions, logprobs and values from agent
         obs = self.next_obs
         terminated = self.next_terminated
-        main_team_obs = t.concat((obs[:, :self.team_size], obs[:self.num_of_self_play_envs, self.team_size:]), dim=0)
+        main_team_obs = t.concat((obs[:, :self.team_size], obs[self.num_of_self_play_envs:, self.team_size:]), dim=0)
         main_team_actions, main_team_logprobs = self.main_team.get_actions(main_team_obs)
         main_team_values = self.main_team.get_values(main_team_obs)
         other_team_actions_list = []
         # other_team_logprobs_list = []
         # other_team_values_list = []
         for i in range(self.num_active_other_teams):
-            first_env_idx = self.num_of_self_play_envs + i * self.num_envs_per_team
+            first_env_idx = i * self.num_envs_per_team # + self.num_of_self_play_envs
             last_env_idx = first_env_idx + self.num_envs_per_team
             other_team_obs = obs[first_env_idx:last_env_idx, :self.team_size]
             other_team_actions, _ = self.active_other_teams[i].get_actions(other_team_obs)
@@ -568,7 +636,7 @@ class PPOPopulation:
         # other_team_values = t.concat(other_team_values_list, dim=0) if len(other_team_values_list) > 0 else t.zeros((0, 2)).to(device)
 
         first_team_actions = main_team_actions[:self.envs.num_envs]
-        second_team_actions = t.concat((main_team_actions[self.envs.num_envs:], other_team_actions), dim=0)
+        second_team_actions = t.concat((other_team_actions, main_team_actions[self.envs.num_envs:]), dim=0)
         actions = t.concat((first_team_actions, second_team_actions), dim=1)
 
         # first_team_logprobs = main_team_logprobs[:self.envs.num_envs]
@@ -581,11 +649,11 @@ class PPOPopulation:
         # step environment and get rewards, terminated
         next_obs, reward, next_terminated, next_truncated, infos = self.envs.step(actions)
         reward = get_team_rewards(reward, infos, self.num_agents)
-        main_team_rewards = np.concatenate((reward[:, :self.team_size], reward[:self.num_of_self_play_envs, self.team_size:]), axis=0)
+        main_team_rewards = np.concatenate((reward[:, :self.team_size], reward[self.num_of_self_play_envs:, self.team_size:]), axis=0)
         # next_terminated = einops.repeat(next_terminated, "num_envs -> num_envs num_agents", num_agents=self.num_agents)
         # next_truncated = einops.repeat(next_truncated, "num_envs -> num_envs num_agents", num_agents=self.num_agents)
-        next_terminated = einops.repeat(np.concatenate((next_terminated, next_terminated[:self.num_of_self_play_envs]), axis=0), "num_main_team_envs -> num_main_team_envs num_agents_in_main_team", num_agents_in_main_team=self.team_size)
-        next_truncated = einops.repeat(np.concatenate((next_truncated, next_truncated[:self.num_of_self_play_envs]), axis=0), "num_main_team_envs -> num_main_team_envs num_agents_in_main_team", num_agents_in_main_team=self.team_size)
+        next_terminated = einops.repeat(np.concatenate((next_terminated, next_terminated[self.num_of_self_play_envs:]), axis=0), "num_main_team_envs -> num_main_team_envs num_agents_in_main_team", num_agents_in_main_team=self.team_size)
+        next_truncated = einops.repeat(np.concatenate((next_truncated, next_truncated[self.num_of_self_play_envs:]), axis=0), "num_main_team_envs -> num_main_team_envs num_agents_in_main_team", num_agents_in_main_team=self.team_size)
         # add to memory
         self.memory.add(
             obs = main_team_obs.cpu().numpy(),
@@ -627,7 +695,7 @@ class PPOPopulation:
         Gets minibatches from the replay memory, and resets the memory
         """
         with t.inference_mode():
-            main_team_obs = t.concat((self.next_obs[:, :self.team_size], self.next_obs[:self.num_of_self_play_envs, self.team_size:]), dim=0)
+            main_team_obs = t.concat((self.next_obs[:, :self.team_size], self.next_obs[self.num_of_self_play_envs:, self.team_size:]), dim=0)
             main_team_values = self.main_team.get_values(main_team_obs)
             # other_team_values_list = []
             # for i in range(self.num_active_other_teams):
@@ -1182,24 +1250,26 @@ if MAIN:
     # Parse command line arguments for neural network architecture
     parser = argparse.ArgumentParser(description='Train PPO agents for soccer')
     parser.add_argument('--num_layers', type=int, default=4, help='Number of hidden layers in the neural network')
-    parser.add_argument('--num_hidden_units', type=int, default=64, help='Number of hidden units per layer')
+    parser.add_argument('--num_hidden_units', type=int, default=128, help='Number of hidden units per layer')
     parser.add_argument('--activation', type=str, default="GELU", choices=["GELU", "Tanh"], help='Activation function to use')
+    parser.add_argument('--reward_specification', type=str, default="dist_and_passing_and_shooting", choices=list(REWARD_SPECIFICATIONS.keys()), help='Reward specification to use')
     
     # Parse args and set global constants
     nn_args = parser.parse_args()
     NUM_LAYERS = nn_args.num_layers
     NUM_HIDDEN_UNITS = nn_args.num_hidden_units
     ACTIVATION_FUNCTION = nn_args.activation
+    REWARD_SPECIFICATION = REWARD_SPECIFICATIONS[nn_args.reward_specification]
     
     # NUM_LAYERS = 2
     # NUM_HIDDEN_UNITS = 64
     # ACTIVATION_FUNCTION = "TanH"
 
-    BASE_RUN_NAME = "Real_Run"
-    RUN_NAME = f"{BASE_RUN_NAME}_{NUM_LAYERS}_layer_{NUM_HIDDEN_UNITS}_hidden_units_{ACTIVATION_FUNCTION}"
+    BASE_RUN_NAME = ""
+    RUN_NAME = f"{BASE_RUN_NAME}_{nn_args.reward_specification}_{NUM_LAYERS}_layer_{NUM_HIDDEN_UNITS}_hidden_units_{ACTIVATION_FUNCTION}"
     
     print(f"RUN_NAME: {RUN_NAME}")
-    
+    print(f"REWARD_SPECIFICATION: {REWARD_SPECIFICATION}")
     
     args = PPOArgs(
         env_id="Soccer-v0",
@@ -1210,7 +1280,7 @@ if MAIN:
         num_agents=4,
         team_size = 2,
         num_teams_per_game=2,
-        total_timesteps=100_000_000,
+        total_timesteps=500_000_000,
         num_steps_per_rollout = 4096,
         num_minibatches = 16,
         batches_per_learning_phase = 8,
@@ -1218,6 +1288,7 @@ if MAIN:
         num_of_self_play_envs = 2,
         expected_num_steps_per_team = 900,
         num_envs_per_team = 1,
+        reward_specification = REWARD_SPECIFICATION,
     )
     trainer = PPOTrainer(args)
     trainer.train()

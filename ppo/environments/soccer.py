@@ -20,6 +20,8 @@ except pygame.error:
     os.environ['SDL_VIDEODRIVER'] = 'dummy'
     pygame.display.init()
 
+from environments.utils import piecewise_function
+
 # Pygame initialization
 pygame.init()
 
@@ -35,17 +37,23 @@ PPM = SCREEN_WIDTH / GAME_WIDTH  # pixels per meter
 FPS = 20
 PLAYER_SIZE = 1.5  # meters
 BALL_RADIUS = 2.0  # meters
-PLAYER_SPEED = 9.0
+PLAYER_SPEED = 12.0
 WALL_THICKNESS = 1.0
-GOAL_WIDTH = 15.0  # meters in width
+GOAL_WIDTH = 24.0 # 15.0  # meters in width
 MAXIMUM_VELOCITY = 50.0  # maximum velocity for observation space#
-REAKISTIC_MAXIMUM_VELOCITY = 12.0
+REALISTIC_MAXIMUM_VELOCITY = 20.0
 SPAWNING_RADIUS = 3.0  # random spawn radius in meters
 
+# For Rewards
+PASSING_DELAY = 8
+PASSING_QUADRATIC_THRESHOLD = 6
+PASSING_THRESHOLD = 10
+PLAYER_DISTANCE_THRESHOLD = 8
+
 # Physics hyperparams
-PLAYER_DENSITY = 1.0
+PLAYER_DENSITY = 2.0
 PLAYER_FRICTION = 0.3
-BALL_DENSITY = 1.0
+BALL_DENSITY = 0.1
 BALL_FRICTION = 0.3
 BALL_RESTITUTION = 0.8
 
@@ -81,39 +89,13 @@ SIMILAR_ACTION_PAIRS = [
 ]
 
 DEFAULT_REWARD_SPECIFICATION = {
-    "goal": 500.0,
-    "first_touch": 50.0,
-    "winning_the_ball_and_passing": 10.0,
-    # "ball_touched_at_all" : 0.05,
+    "goal": 100.0,
+    "winning_the_ball_and_passing": 2.0,
     "smoothness": 0.05,
-    "stay_in_field": 0.02,
-    "stay_own_half": 0.02,
-    # "velocity_to_goal": 0.005,
-    # "dist_to_goal": 0.0025,
-}
-
-WALK_TO_BALL_SPECIFICATION = {
-    # "dist_to_ball": 0.05,
-    "velocity_to_ball": 1.0,
-}
-
-'''DEBUG_REWARD_SPECIFICATION = {
-    "goal": 10.0,
-    "winning_the_ball_and_passing": 1.0,
     "stay_in_field": 0.05,
-    "smoothness": 0.05,
-    "dist_to_ball": 0.05,
-    "dist_to_goal": 0.05,
-    "velocity_to_goal": 0.05,
-    "velocity_to_ball": 0.05,
     "stay_own_half": 0.05,
-}'''
-
-# DEBUG_REWARD_SPECIFICATION = {
-#     "dist_to_ball": 1.0,
-# }
-# DEFAULT_REWARD_SPECIFICATION = DEBUG_REWARD_SPECIFICATION
-# DEFAULT_REWARD_SPECIFICATION = WALK_TO_BALL_SPECIFICATION
+    "base_negative": -0.15,
+}
 
 class SoccerContactListener(Box2D.b2ContactListener):
     def __init__(self, env):
@@ -126,15 +108,18 @@ class SoccerContactListener(Box2D.b2ContactListener):
         body_b = contact.fixtureB.body
 
         # Determine which body is the ball and which is the player
-        if body_a.userData is not None and body_b.userData is not None:
-            if body_a.userData.get('type') == 'ball' and 'team' in body_b.userData:
-                # body_a is ball, body_b is player
-                self.env.ball_touched[body_b.userData['team']] = True
-                self.env.ball_toucher = body_b.userData['id']
-            elif body_b.userData.get('type') == 'ball' and 'team' in body_a.userData:
-                # body_b is ball, body_a is player
-                self.env.ball_touched[body_a.userData['team']] = True
-                self.env.ball_toucher = body_a.userData['id']
+        if body_a.userData is None or body_b.userData is None:
+            return
+        if body_a.userData.get('type') == 'ball' and 'team' in body_b.userData:
+            ball, player = body_a, body_b
+        elif body_b.userData.get('type') == 'ball' and 'team' in body_a.userData:
+            ball, player = body_b, body_a
+        else:
+            return
+        # body_a is ball, body_b is player
+        self.env.ball_touched[player.userData['team']] = True
+        self.env.ball_toucher = player.userData['id']
+        self.env.ball_touch_coordinate = ball.position
 
     def EndContact(self, contact):
         pass
@@ -150,6 +135,7 @@ class Soccer(gym.Env):
     
     def __init__(self, render_mode=None, video_log_freq=100, env_id="Soccer-v0", seed=1, reward_specification=DEFAULT_REWARD_SPECIFICATION):
         super().__init__()
+        print(f"reward_specification: {reward_specification}")
         
         # Environment parameters
         self.num_agents = 4
@@ -161,8 +147,6 @@ class Soccer(gym.Env):
         self.env_id = env_id
         self.seed = seed
         self.reward_specification = reward_specification
-        self.local_position_history = []
-        self.first_touch_happened = False
 
         # Observation and action spaces
         # Each agent observes: 
@@ -300,6 +284,8 @@ class Soccer(gym.Env):
                 friction=BALL_FRICTION,
                 restitution=BALL_RESTITUTION,
             ),
+            linearDamping=BALL_FRICTION,
+            angularDamping=BALL_FRICTION,
         )
         self.ball.userData = {"type": "ball"}
         self.reset_ball()
@@ -312,7 +298,18 @@ class Soccer(gym.Env):
         self.last_ball_toucher = None # last agent that touched the ball, isnt reset when noone touches it
         self.ball_toucher_history = [] # history of agents that touched the ball, noone is None
         self.ball_toucher = None # last agent that touched the ball, is reset when noone touches it
-    
+        self.last_ball_touch_coordinate = None # last coordinates of the ball, is not reset when noone touches it
+        self.ball_touch_coordinate = None # coordinates of the ball, is reset when noone touches it
+
+    def update_ball_touch_variables(self):
+        """Update self.ball_toucher, self.last_ball_toucher, self.ball_touch_coordinate, self.last_ball_touch_coordinate"""
+        if self.ball_toucher is not None:
+            self.last_ball_toucher = self.ball_toucher
+        self.ball_toucher = None
+        if self.ball_touch_coordinate is not None:
+            self.last_ball_touch_coordinate = self.ball_touch_coordinate.copy()
+        self.ball_touch_coordinate = None
+        
     def check_goal(self):
         ball_pos = self.ball.position
         if ball_pos.y < 0:  # Bottom goal (Team 2 scores)
@@ -362,7 +359,7 @@ class Soccer(gym.Env):
         elif agent_id == 3:  # Top right
             new_vel = np.array([-vx, -vy])
         if normalize:
-            new_vel = new_vel / REAKISTIC_MAXIMUM_VELOCITY
+            new_vel = new_vel / REALISTIC_MAXIMUM_VELOCITY
         return new_vel
         
     def get_global_velocity(self, vel, agent_id):
@@ -453,7 +450,7 @@ class Soccer(gym.Env):
                 if team == scoring_team:
                     team_rewards[team] += 1  # Big reward for scoring team
                 else:
-                    team_rewards[team] += -0.25  # Penalty for conceding team
+                    team_rewards[team] += -0.5  # Penalty for conceding team
         return team_rewards
     
     def get_stay_in_field_reward(self, agent_idx):
@@ -499,28 +496,56 @@ class Soccer(gym.Env):
             return team_rewards
         if len(self.ball_toucher_history) < 3: # less than 3 steps in
             return team_rewards
-        if not (self.ball_toucher_history[-2] is None and self.ball_toucher_history[-1] is None):
+        if not (self.ball_toucher_history[-3] is None and self.ball_toucher_history[-2] is None):
             return team_rewards
         if self.last_ball_toucher == self.ball_toucher:
             return team_rewards
         for team in range(self.num_teams):
-            last_ball_toucher_team = self.last_ball_toucher // self.team_size
-            if self.ball_touched[team]:
-                team_rewards[team] += 1
-            elif last_ball_toucher_team == team:
-                team_rewards[team] += -0.5
+            ball_toucher_team = self.ball_toucher // self.team_size
+            if team == ball_toucher_team:
+                team_rewards[team] += 1.0
+            else:
+                team_rewards[team] += -1.0
         return team_rewards
-
+    
     def get_normalized_distance(self, vector1 : Box2D.b2Vec2, vector2 : Box2D.b2Vec2, max_distance = GAME_WIDTH + GAME_HEIGHT):
         distance = np.sqrt((vector1.x - vector2.x)**2 + (vector1.y - vector2.y)**2)
         normalized_distance = distance / max_distance
         return normalized_distance
 
+    def get_distance_based_passing_reward(self):
+        """Calculate reward for distance based passing"""
+        team_rewards = np.zeros(self.num_teams)
+        if self.ball_touch_coordinate is None:
+            return team_rewards
+        ball_touch_team = self.ball_toucher // self.team_size
+        if self.last_ball_touch_coordinate is None:
+            team_rewards[ball_touch_team] += 1.0
+            return team_rewards
+        if self.ball_toucher == self.last_ball_toucher:
+            return team_rewards
+        distance = self.get_normalized_distance(self.ball_touch_coordinate, self.last_ball_touch_coordinate, 1.0)
+        team_rewards[ball_touch_team] += piecewise_function(distance, PASSING_QUADRATIC_THRESHOLD, PASSING_THRESHOLD)
+        return team_rewards
+
+    def get_player_distance_reward(self):
+        """Calculate reward for player distance"""
+        team_rewards = np.zeros(self.num_teams)
+        for team in range(self.num_teams):
+            agents_in_team = [i for i in range(team * self.team_size, (team + 1) * self.team_size)]
+            # iterate over all pairs of agents
+            for i in range(len(agents_in_team)):
+                for j in range(i + 1, len(agents_in_team)):
+                    distance = self.get_normalized_distance(self.players[agents_in_team[i]].position, self.players[agents_in_team[j]].position, 1.0)
+                    if distance >= 8:
+                        continue
+                    team_rewards[team] += (PLAYER_DISTANCE_THRESHOLD - distance)**2 / PLAYER_DISTANCE_THRESHOLD**2
+        return team_rewards
+
     def get_dist_to_ball_reward(self, agent_idx, only_beginning=True):
         """Calculate reward for distance to ball"""
         if only_beginning:
             return 0.0
-        
         normalized_distance = self.get_normalized_distance(self.players[agent_idx].position, self.ball.position)
         return 1.0 - normalized_distance
     
@@ -542,7 +567,7 @@ class Soccer(gym.Env):
     def get_velocity_to_ball_reward(self, agent_idx):
         """Calculate reward for velocity towards the ball"""
         player = self.players[agent_idx]
-        normalized_dot_product = self.get_normalized_dot_product(player.linearVelocity, self.ball.position - player.position, REAKISTIC_MAXIMUM_VELOCITY)
+        normalized_dot_product = self.get_normalized_dot_product(player.linearVelocity, self.ball.position - player.position, REALISTIC_MAXIMUM_VELOCITY)
         return normalized_dot_product
 
     def get_velocity_to_goal_reward(self):
@@ -550,7 +575,7 @@ class Soccer(gym.Env):
         team_rewards = np.zeros(self.num_teams)
         for team in range(self.num_teams):
             pos_of_enemy_goal = Box2D.b2Vec2(GAME_WIDTH / 2, GAME_HEIGHT if team == 0 else 0)
-            normalized_dot_product = self.get_normalized_dot_product(self.ball.linearVelocity, pos_of_enemy_goal - self.ball.position, REAKISTIC_MAXIMUM_VELOCITY)
+            normalized_dot_product = self.get_normalized_dot_product(self.ball.linearVelocity, pos_of_enemy_goal - self.ball.position, REALISTIC_MAXIMUM_VELOCITY)
             team_rewards[team] = normalized_dot_product
         return team_rewards
 
@@ -571,29 +596,51 @@ class Soccer(gym.Env):
         team_rewards = np.zeros(self.num_teams)
         if self.first_touch_happened:
             return team_rewards
-        if self.ball.last_ball_toucher is None:
+        if self.last_ball_toucher is None:
             return team_rewards
-        first_touch_team = self.ball.last_ball_toucher // self.team_size
+        first_touch_team = self.last_ball_toucher // self.team_size
         other_team = 1 - first_touch_team
         team_rewards[first_touch_team] = 1.0
         team_rewards[other_team] = -0.5
         self.first_touch_happened = True
         return team_rewards
+    
+    def get_shooting_reward(self):
+        """Calculate reward for shooting"""
+        team_rewards = np.zeros(self.num_teams)
+        if self.last_ball_toucher is None:
+            return team_rewards
+        shooting_team = self.last_ball_toucher // self.team_size
+        ball_speed = np.sqrt(self.ball.linearVelocity.x**2 + self.ball.linearVelocity.y**2)
+        team_rewards[shooting_team] = ball_speed / REALISTIC_MAXIMUM_VELOCITY
+        return team_rewards
+    
+    def get_base_negative_reward(self):
+        """Calculate reward for base negative reward"""
+        return np.ones(self.num_teams)
         
     def calculate_rewards(self, goal_scored):
         """Calculate rewards for all agents"""
         rewards = np.zeros(self.num_agents)
         team_rewards = np.zeros(self.num_teams)
+        if "base_negative" in self.reward_specification:
+            team_rewards += self.reward_specification["base_negative"] * self.get_base_negative_reward()
         if "goal" in self.reward_specification:
             team_rewards += self.reward_specification["goal"] * self.get_goal_reward(goal_scored)
         if "winning_the_ball_and_passing" in self.reward_specification:
             team_rewards += self.reward_specification["winning_the_ball_and_passing"] * self.get_winning_the_ball_and_passing_reward()
+        if "distance_based_passing" in self.reward_specification:
+            team_rewards += self.reward_specification["distance_based_passing"] * self.get_distance_based_passing_reward()
+        if "player_distance" in self.reward_specification:
+            team_rewards += self.reward_specification["player_distance"] * self.get_player_distance_reward()
         if "velocity_to_goal" in self.reward_specification:
             team_rewards += self.reward_specification["velocity_to_goal"] * self.get_velocity_to_goal_reward()
         if "dist_to_goal" in self.reward_specification:
             team_rewards += self.reward_specification["dist_to_goal"] * self.get_dist_to_goal_reward()
         if "first_touch" in self.reward_specification:
             team_rewards += self.reward_specification["first_touch"] * self.get_first_touch_reward()
+        if "shooting" in self.reward_specification:
+            team_rewards += self.reward_specification["shooting"] * self.get_shooting_reward()
         # calculate rewards
         for team_idx in range(self.num_teams):
             team_start = team_idx * self.team_size
@@ -605,11 +652,11 @@ class Soccer(gym.Env):
                     team_rewards[team_idx] += 1/self.team_size * self.reward_specification["smoothness"] * self.get_smoothness_reward(agent_idx)
                 if "velocity_to_ball" in self.reward_specification:
                     team_rewards[team_idx] += 1/self.team_size * self.reward_specification["velocity_to_ball"] * self.get_velocity_to_ball_reward(agent_idx)
-                # Some rewards should only be calculated for one player
-                if "dist_to_ball" in self.reward_specification:
-                    team_rewards[team_idx] = max(team_rewards[team_idx], self.reward_specification["dist_to_ball"] * self.get_dist_to_ball_reward(agent_idx))
-                if "stay_own_half" in self.reward_specification:
-                    team_rewards[team_idx] = max(team_rewards[team_idx], self.reward_specification["stay_own_half"] * self.get_stay_own_half_reward(agent_idx))
+            # Some rewards should only be calculated for one player
+            if "dist_to_ball" in self.reward_specification:
+                team_rewards[team_idx] += self.reward_specification["dist_to_ball"] * max([self.get_dist_to_ball_reward(agent_idx) for agent_idx in range(team_start, team_end)])
+            if "stay_own_half" in self.reward_specification:
+                team_rewards[team_idx] += self.reward_specification["stay_own_half"] * max([self.get_stay_own_half_reward(agent_idx) for agent_idx in range(team_start, team_end)])
         # Distribute team rewards to individual agents
         # Currently the reward needs to be the same for all agents in a tean!!!
         for i in range(self.num_agents):
@@ -658,9 +705,7 @@ class Soccer(gym.Env):
             global_vel = self.get_global_velocity(local_vel, i)
             player.linearVelocity = Box2D.b2Vec2(global_vel[0], global_vel[1])
         
-        if self.ball_toucher is not None:
-            self.last_ball_toucher = self.ball_toucher
-        self.ball_toucher = None
+        self.update_ball_touch_variables()
 
         # Update physics
         self.world.Step(1.0/FPS, 6, 2)
@@ -706,6 +751,8 @@ class Soccer(gym.Env):
         """Reset the environment"""
         super().reset(seed=seed)
         self.action_history = []
+        self.first_touch_happened = False
+        self.local_position_history = []
         
         # Clear the world
         for body in self.world.bodies:
