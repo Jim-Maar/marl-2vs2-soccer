@@ -103,6 +103,16 @@ DIST_AND_PASSING_REWARD_SPECIFICATION_3 = {
     "base_negative": -0.25,
 }
 
+DIST_AND_PASSING_REWARD_SPECIFICATION_4 = {
+    "goal": 100.0,
+    "distance_based_passing": 1.5,
+    "player_distance": -0.05,
+    "smoothness": 0.05,
+    "stay_in_field": 0.1,
+    "stay_own_half": 0.05,
+    "base_negative": -0.25,
+}
+
 DIST_AND_PASSING_AND_SHOOTING_REWARD_SPECIFICATION = {
     "goal": 200.0,
     "distance_based_passing": 2.0,
@@ -120,6 +130,7 @@ REWARD_SPECIFICATIONS = {
     "dist_and_passing": DIST_AND_PASSING_REWARD_SPECIFICATION,
     "dist_and_passing_2": DIST_AND_PASSING_REWARD_SPECIFICATION_2,
     "dist_and_passing_3": DIST_AND_PASSING_REWARD_SPECIFICATION_3,
+    "dist_and_passing_4": DIST_AND_PASSING_REWARD_SPECIFICATION_4,
     "dist_and_passing_and_shooting": DIST_AND_PASSING_AND_SHOOTING_REWARD_SPECIFICATION,
 }
 
@@ -454,9 +465,6 @@ class ReplayMemory:
         self.values = np.concatenate((self.values, values[None, :, :]))
         self.rewards = np.concatenate((self.rewards, rewards[None, :, :]))
         self.terminated = np.concatenate((self.terminated, terminated[None, :, :]))
-        # Create array filled with agent_idx and concatenate
-        # agent_idx_array = np.full((self.num_envs), fill_value=agent_idx, dtype=np.int32)
-        # self.agent_idx = np.concatenate((self.agent_idx, agent_idx_array[None, :]))
 
     def get_minibatches(
         self, next_value: Tensor, next_terminated: Tensor, gamma: float, gae_lambda: float
@@ -492,48 +500,6 @@ class ReplayMemory:
         self.reset()
 
         return minibatches
-    
-"""
-if MAIN:
-    num_steps_per_rollout = 128
-    num_envs = 2
-    batch_size = num_steps_per_rollout * num_envs  # 256
-
-    minibatch_size = 128
-    num_minibatches = batch_size // minibatch_size  # 2
-
-    batches_per_learning_phase = 2
-
-    envs = gym.vector.SyncVectorEnv([make_env("CartPole-v1", i, i, "test") for i in range(num_envs)])
-    memory = ReplayMemory(num_envs, (4,), (), batch_size, minibatch_size, batches_per_learning_phase)
-
-    logprobs = values = np.zeros(envs.num_envs)  # dummy values, just so we can see demo of plot
-    obs, _ = envs.reset()
-
-    for i in range(args.num_steps_per_rollout):
-        # Choose random action, and take a step in the environment
-        actions = envs.action_space.sample()
-        next_obs, rewards, terminated, truncated, infos = envs.step(actions)
-
-        # Add experience to memory
-        memory.add(obs, actions, logprobs, values, rewards, terminated)
-        obs = next_obs
-
-    plot_cartpole_obs_and_dones(
-        memory.obs,
-        memory.terminated,
-        title="Current obs s<sub>t</sub><br>Dotted lines indicate d<sub>t+1</sub> = 1, solid lines are environment separators",
-    )
-
-    next_value = next_done = t.zeros(envs.num_envs).to(device)  # dummy values, just so we can see demo of plot
-    minibatches = memory.get_minibatches(next_value, next_done, gamma=0.99, gae_lambda=0.95)
-
-    plot_cartpole_obs_and_dones(
-        minibatches[0].obs.cpu(),
-        minibatches[0].terminated.cpu(),
-        title="Current obs (sampled)<br>this is what gets fed into our model for training",
-    )
-"""
 
 def get_team_rewards(reward: Float[Arr, "num_envs"], infos: dict, num_agents: int) -> Float[Arr, "num_envs num_teams_per_game"]:
     # TODO: test this for more than two agents ...
@@ -555,8 +521,6 @@ def get_team_rewards(reward: Float[Arr, "num_envs"], infos: dict, num_agents: in
                 else:
                     other_reward.append(infos["final_info"][env_idx]["other_reward"])
             other_reward = np.stack(other_reward, axis=0)
-            # other_reward = np.concatenate([np.stack(infos["other_reward"][:-1], axis=0), infos["final_info"][-1]["other_reward"][None, :]], axis=0)
-            # other_reward = np.array([info["other_reward"] for info in infos["final_info"]]) # might be important for mappo_selfplay_test
         else:
             assert "other_reward" in infos
             other_reward = np.stack(infos["other_reward"], axis=0)
@@ -619,39 +583,19 @@ class PPOPopulation:
         main_team_actions, main_team_logprobs = self.main_team.get_actions(main_team_obs)
         main_team_values = self.main_team.get_values(main_team_obs)
         other_team_actions_list = []
-        # other_team_logprobs_list = []
-        # other_team_values_list = []
         for i in range(self.num_active_other_teams):
             first_env_idx = i * self.num_envs_per_team # + self.num_of_self_play_envs
             last_env_idx = first_env_idx + self.num_envs_per_team
             other_team_obs = obs[first_env_idx:last_env_idx, :self.team_size]
             other_team_actions, _ = self.active_other_teams[i].get_actions(other_team_obs)
-            # other_team_values = self.active_other_teams[i].get_values(other_team_obs)
             other_team_actions_list.append(other_team_actions)
-            # other_team_logprobs_list.append(other_team_logprobs)
-            # other_team_values_list.append(other_team_values)
-
         other_team_actions = t.concat(other_team_actions_list, dim=0) if len(other_team_actions_list) > 0 else t.zeros((0, 2)).to(device)
-        # other_team_logprobs = t.concat(other_team_logprobs_list, dim=0) if len(other_team_logprobs_list) > 0 else t.zeros((0, 2)).to(device)
-        # other_team_values = t.concat(other_team_values_list, dim=0) if len(other_team_values_list) > 0 else t.zeros((0, 2)).to(device)
-
         first_team_actions = main_team_actions[:self.envs.num_envs]
         second_team_actions = t.concat((other_team_actions, main_team_actions[self.envs.num_envs:]), dim=0)
         actions = t.concat((first_team_actions, second_team_actions), dim=1)
-
-        # first_team_logprobs = main_team_logprobs[:self.envs.num_envs]
-        # second_team_logprobs = t.concat((main_team_logprobs[self.envs.num_envs:], other_team_logprobs), dim=0)
-        # logprobs = t.concat((first_team_logprobs, second_team_logprobs), dim=1)
-
-        # first_team_values = main_team_values[:self.envs.num_envs]
-        # second_team_values = t.concat((main_team_values[self.envs.num_envs:], other_team_values), dim=0)
-        # values = t.concat((first_team_values, second_team_values), dim=1)
-        # step environment and get rewards, terminated
         next_obs, reward, next_terminated, next_truncated, infos = self.envs.step(actions)
         reward = get_team_rewards(reward, infos, self.num_agents)
         main_team_rewards = np.concatenate((reward[:, :self.team_size], reward[self.num_of_self_play_envs:, self.team_size:]), axis=0)
-        # next_terminated = einops.repeat(next_terminated, "num_envs -> num_envs num_agents", num_agents=self.num_agents)
-        # next_truncated = einops.repeat(next_truncated, "num_envs -> num_envs num_agents", num_agents=self.num_agents)
         next_terminated = einops.repeat(np.concatenate((next_terminated, next_terminated[self.num_of_self_play_envs:]), axis=0), "num_main_team_envs -> num_main_team_envs num_agents_in_main_team", num_agents_in_main_team=self.team_size)
         next_truncated = einops.repeat(np.concatenate((next_truncated, next_truncated[self.num_of_self_play_envs:]), axis=0), "num_main_team_envs -> num_main_team_envs num_agents_in_main_team", num_agents_in_main_team=self.team_size)
         # add to memory
@@ -697,21 +641,7 @@ class PPOPopulation:
         with t.inference_mode():
             main_team_obs = t.concat((self.next_obs[:, :self.team_size], self.next_obs[self.num_of_self_play_envs:, self.team_size:]), dim=0)
             main_team_values = self.main_team.get_values(main_team_obs)
-            # other_team_values_list = []
-            # for i in range(self.num_active_other_teams):
-            #     first_env_idx = self.num_of_self_play_envs + i * self.num_envs_per_team
-            #     last_env_idx = first_env_idx + self.num_envs_per_team
-            #     other_team_obs = self.next_obs[first_env_idx:last_env_idx, :self.team_size]
-            #     other_team_values = self.active_other_teams[i].get_values(other_team_obs)
-            #     other_team_values_list.append(other_team_values)
-
-            # other_team_values = t.concat(other_team_values_list, dim=0) if len(other_team_values_list) > 0 else t.zeros((0, 2)).to(device)
-            # first_team_values = main_team_values[:self.envs.num_envs]
-            # second_team_values = t.concat((main_team_values[self.envs.num_envs:], other_team_values), dim=0)
-            # next_value = t.concat((first_team_values, second_team_values), dim=1)
             next_value = main_team_values
-
-            # next_value = self.critic(self.next_obs).squeeze(dim=-1) # This was the original line (I need to check if the shapes are the same ...)
         minibatches = self.memory.get_minibatches(next_value, self.next_terminated, gamma, gae_lambda)
         self.memory.reset()
         return minibatches
@@ -753,122 +683,6 @@ class PPOTeam:
         with t.inference_mode():
             values = self.critic(obs).squeeze(dim=-1)
         return values
-
-'''class PPOAgents:
-    critic: nn.Sequential
-    actor: nn.Sequential
-
-    def __init__(self, envs: gym.vector.SyncVectorEnv, actor: nn.Module, critic: nn.Module, memory: ReplayMemory, num_agents: int, num_teams_per_game: int):
-        super().__init__()
-        self.envs = envs
-        self.actor = actor
-        self.critic = critic
-        self.memory = memory
-        self.num_agents = num_agents
-        self.num_teams_per_game = num_teams_per_game
-        self.team_size = num_agents // num_teams_per_game
-        # self.get_obs_for_agent = get_obs_for_agent
-
-        self.step = 0  # Tracking number of steps taken (across all environments)
-        
-        # Original line that causes the error
-        self.next_obs = t.tensor(envs.reset()[0], device=device, dtype=t.float)  # need starting obs (in tensor form)
-        if self.num_agents == 1:
-            self.next_obs = self.next_obs.unsqueeze(dim=1)
-        self.next_terminated = t.zeros((envs.num_envs, self.num_agents), device=device, dtype=t.bool)  # need starting termination=False
-
-    def play_step(self) -> list[dict]:
-        """
-        Carries out a single interaction step between the agent and the environment, and adds results to the replay memory.
-
-        Returns the list of info dicts returned from `self.envs.step`.
-        """
-        # Get newest observations (i.e. where we're starting from)
-        obs_global = self.next_obs
-        terminated = self.next_terminated
-
-        # Compute logits based on newest observation, and use it to get an action distribution we sample from
-        # TODO: add multiple agents, sample the action of each of them
-        with t.inference_mode():
-            logits = self.actor(obs_global)
-        dist = Categorical(logits=logits)
-        actions = dist.sample()
-        logprobs = dist.log_prob(actions)
-
-        # Step environment based on the sampled action
-        if self.num_agents == 1:
-            input_actions = actions.squeeze(dim=1).cpu().numpy()
-        else:
-            input_actions = actions.cpu().numpy()
-        next_obs_global, reward, next_terminated, next_truncated, infos = self.envs.step(input_actions)
-        rewards = get_team_rewards(reward, infos, self.num_agents)
-        assert rewards.shape == (self.envs.num_envs, self.num_agents)
-        next_terminated = einops.repeat(next_terminated, "num_envs -> num_envs num_agents", num_agents=self.num_agents)
-        next_truncated = einops.repeat(next_truncated, "num_envs -> num_envs num_agents", num_agents=self.num_agents)
-        
-        # Calculate logprobs and values, and add this all to replay memory
-        # Vectorize code down below to compute everything for every agent at the same time (every shape should start with (num_envs, num_agents))
-        environment_idx = t.arange(self.envs.num_envs, device=device)
-        agent_idx = t.arange(self.num_agents, device=device)
-        team_idx = agent_idx // self.team_size
-        first_agent_idx = team_idx * self.team_size
-        team_obs = obs_global[:, first_agent_idx, :]
-        with t.inference_mode():
-            values = self.critic(team_obs).squeeze(dim=-1).cpu().numpy()
-
-        self.memory.add(
-            obs = obs_global.cpu().numpy(),
-            obs_global = team_obs.cpu().numpy(),
-            actions = actions.cpu().numpy(),
-            logprobs = logprobs.cpu().numpy(),
-            values = values,
-            rewards = rewards,
-            terminated = terminated.cpu().numpy(),
-        )
-        """values = []
-        for team_idx in range(self.num_teams_per_game):
-            first_agent_idx = team_idx * self.team_size
-            team_obs = obs_global[:, first_agent_idx]
-            with t.inference_mode():
-                values.append(self.critic(team_obs).flatten().cpu().numpy()) # TODO: .flatten needed?
-        values = np.stack(values, axis=1)
-        # Add to memory for each agent (obs, action, logprob seperately) (values, rewards, terminated together)
-        for agent_idx in range(self.num_agents):
-            team_idx = agent_idx // self.team_size
-            actions = agent_actions[:, agent_idx]
-            obs = obs_global[:, agent_idx]
-            dist = agent_dists[agent_idx]
-            logprobs = dist.log_prob(actions).cpu().numpy()
-            self.memory.add(
-                obs.cpu().numpy(),
-                obs_global.cpu().numpy(),
-                actions.cpu().numpy(),
-                logprobs,
-                values[:, team_idx],
-                rewards[:, team_idx],
-                terminated.cpu().numpy(),
-                agent_idx,
-            )"""
-
-        # Set next observation & termination state
-        self.next_obs = t.from_numpy(next_obs_global).to(device, dtype=t.float)
-        if self.num_agents == 1:
-            self.next_obs = self.next_obs.unsqueeze(dim=1)
-        self.next_terminated = t.from_numpy(next_terminated).to(device, dtype=t.float)
-
-        self.step += self.envs.num_envs * self.num_agents
-        return infos
-
-    def get_minibatches(self, gamma: float, gae_lambda: float) -> list[ReplayMinibatch]:
-        """
-        Gets minibatches from the replay memory, and resets the memory
-        """
-        with t.inference_mode():
-            next_value = self.critic(self.next_obs).squeeze(dim=-1)
-        minibatches = self.memory.get_minibatches(next_value, self.next_terminated, gamma, gae_lambda)
-        self.memory.reset()
-        return minibatches'''
- 
 
 def calc_clipped_surrogate_objective(
     probs: Categorical,
@@ -1149,6 +963,54 @@ class PPOTrainer:
         if self.args.use_wandb:
             wandb.finish()
 
+gym.envs.registration.register(id="Soccer-v0", entry_point=Soccer, apply_api_compatibility=False)
+if MAIN:
+    # Parse command line arguments for neural network architecture
+    parser = argparse.ArgumentParser(description='Train PPO agents for soccer')
+    parser.add_argument('--num_layers', type=int, default=4, help='Number of hidden layers in the neural network')
+    parser.add_argument('--num_hidden_units', type=int, default=128, help='Number of hidden units per layer')
+    parser.add_argument('--activation', type=str, default="GELU", choices=["GELU", "Tanh"], help='Activation function to use')
+    parser.add_argument('--reward_specification', type=str, default="dist_and_passing_and_shooting", choices=list(REWARD_SPECIFICATIONS.keys()), help='Reward specification to use')
+    
+    # Parse args and set global constants
+    nn_args = parser.parse_args()
+    NUM_LAYERS = nn_args.num_layers
+    NUM_HIDDEN_UNITS = nn_args.num_hidden_units
+    ACTIVATION_FUNCTION = nn_args.activation
+    REWARD_SPECIFICATION = REWARD_SPECIFICATIONS[nn_args.reward_specification]
+
+    BASE_RUN_NAME = ""
+    RUN_NAME = f"{BASE_RUN_NAME}_{nn_args.reward_specification}_{NUM_LAYERS}_layer_{NUM_HIDDEN_UNITS}_hidden_units_{ACTIVATION_FUNCTION}"
+    
+    print(f"RUN_NAME: {RUN_NAME}")
+    print(f"REWARD_SPECIFICATION: {REWARD_SPECIFICATION}")
+    
+    args = PPOArgs(
+        env_id="Soccer-v0",
+        mode="soccer",
+        use_wandb=False,
+        video_log_freq=50,
+        num_envs=4,
+        num_agents=4,
+        team_size = 2,
+        num_teams_per_game=2,
+        total_timesteps=500_000_000,
+        num_steps_per_rollout = 4096,
+        num_minibatches = 16,
+        batches_per_learning_phase = 8,
+        num_steps_per_checkpoint = 100_000,
+        num_of_self_play_envs = 2,
+        expected_num_steps_per_team = 900,
+        num_envs_per_team = 1,
+        reward_specification = REWARD_SPECIFICATION,
+    )
+    trainer = PPOTrainer(args)
+    trainer.train()
+    # save trainer with pickle
+    with open("soccer_trainer.pkl", "wb") as f:
+        pickle.dump(trainer, f)
+
+'''
 def test_probe(probe_idx: int):
     """
     Tests a probe environment by training a network on it & verifying that the value functions are
@@ -1244,54 +1106,4 @@ def test_mappo_selfplay():
 
 # if MAIN:
 #     test_mappo_selfplay()
-
-gym.envs.registration.register(id="Soccer-v0", entry_point=Soccer, apply_api_compatibility=False)
-if MAIN:
-    # Parse command line arguments for neural network architecture
-    parser = argparse.ArgumentParser(description='Train PPO agents for soccer')
-    parser.add_argument('--num_layers', type=int, default=4, help='Number of hidden layers in the neural network')
-    parser.add_argument('--num_hidden_units', type=int, default=128, help='Number of hidden units per layer')
-    parser.add_argument('--activation', type=str, default="GELU", choices=["GELU", "Tanh"], help='Activation function to use')
-    parser.add_argument('--reward_specification', type=str, default="dist_and_passing_and_shooting", choices=list(REWARD_SPECIFICATIONS.keys()), help='Reward specification to use')
-    
-    # Parse args and set global constants
-    nn_args = parser.parse_args()
-    NUM_LAYERS = nn_args.num_layers
-    NUM_HIDDEN_UNITS = nn_args.num_hidden_units
-    ACTIVATION_FUNCTION = nn_args.activation
-    REWARD_SPECIFICATION = REWARD_SPECIFICATIONS[nn_args.reward_specification]
-    
-    # NUM_LAYERS = 2
-    # NUM_HIDDEN_UNITS = 64
-    # ACTIVATION_FUNCTION = "TanH"
-
-    BASE_RUN_NAME = ""
-    RUN_NAME = f"{BASE_RUN_NAME}_{nn_args.reward_specification}_{NUM_LAYERS}_layer_{NUM_HIDDEN_UNITS}_hidden_units_{ACTIVATION_FUNCTION}"
-    
-    print(f"RUN_NAME: {RUN_NAME}")
-    print(f"REWARD_SPECIFICATION: {REWARD_SPECIFICATION}")
-    
-    args = PPOArgs(
-        env_id="Soccer-v0",
-        mode="soccer",
-        use_wandb=False,
-        video_log_freq=50,
-        num_envs=4,
-        num_agents=4,
-        team_size = 2,
-        num_teams_per_game=2,
-        total_timesteps=500_000_000,
-        num_steps_per_rollout = 4096,
-        num_minibatches = 16,
-        batches_per_learning_phase = 8,
-        num_steps_per_checkpoint = 100_000,
-        num_of_self_play_envs = 2,
-        expected_num_steps_per_team = 900,
-        num_envs_per_team = 1,
-        reward_specification = REWARD_SPECIFICATION,
-    )
-    trainer = PPOTrainer(args)
-    trainer.train()
-    # save trainer with pickle
-    with open("soccer_trainer.pkl", "wb") as f:
-        pickle.dump(trainer, f)
+'''

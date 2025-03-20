@@ -450,7 +450,7 @@ class Soccer(gym.Env):
                 if team == scoring_team:
                     team_rewards[team] += 1  # Big reward for scoring team
                 else:
-                    team_rewards[team] += -0.5  # Penalty for conceding team
+                    team_rewards[team] += -0.9  # Penalty for conceding team
         return team_rewards
     
     def get_stay_in_field_reward(self, agent_idx):
