@@ -179,11 +179,6 @@ class Soccer(gym.Env):
         self.contact_listener = SoccerContactListener(self)
         self.world.contactListener = self.contact_listener
         
-        # For video recording
-        self.frames = []
-        self.step_count = 0
-        self.episode_count = 0
-        
         # Reset to initialize everything
         self.reset()
 
@@ -468,16 +463,6 @@ class Soccer(gym.Env):
         return (action1, action2) in SIMILAR_ACTION_PAIRS or (action2, action1) in SIMILAR_ACTION_PAIRS
 
     def get_smoothness_reward(self, agent_idx=None):
-        """Calculate reward for smoothness of actions"""
-        '''if len(self.action_history) < 2:
-            return 0.0
-            
-        current_action = self.action_history[-1][agent_idx]
-        previous_action = self.action_history[-2][agent_idx]
-        if self.are_actions_similar(current_action, previous_action):
-            return 1.0
-        else:
-            return -1.0'''
         if len(self.local_position_history) < 2:
             return 0.0
         previous_position = self.local_position_history[0][agent_idx]
@@ -733,14 +718,9 @@ class Soccer(gym.Env):
         terminated = goal_scored >= 0  # Episode ends if a goal is scored
         truncated = self.step_count >= self.max_steps  # Or if max steps reached
         
-        # Reset if needed
-        if terminated or truncated:
-            # if self.render_mode is not None and (self.episode_count % self.video_log_freq == 0):
-            #     self.save_video()
-            
-            # Don't actually reset here, just prepare for the next reset
-            if terminated:
-                self.reset_ball()
+        # Don't actually reset here, just prepare for the next reset
+        if terminated:
+            self.reset_ball()
         
         # Format rewards like in mappo_selfplay_test
         info = {"other_reward": rewards[1:]}
@@ -760,7 +740,6 @@ class Soccer(gym.Env):
         
         # Reset step counter
         self.step_count = 0
-        self.episode_count += 1
         
         # Create boundaries, players, and ball
         self.create_boundaries()
@@ -769,9 +748,6 @@ class Soccer(gym.Env):
         
         # Reset score
         self.score = [0, 0]  # [team1_score, team2_score]
-        
-        # Clear frames for new episode
-        self.frames = []
         
         # Get initial observations
         observations = self.get_observations()
@@ -827,29 +803,6 @@ class Soccer(gym.Env):
         
         # Return rgb array
         return pygame.surfarray.array3d(self.screen)
-    
-    def save_video(self):
-        """Save recorded frames as a video"""
-        if not self.frames:
-            return
-        
-        try:
-            import numpy as np
-            import imageio
-            video_dir = Path(__file__).parent / "videos"
-            video_dir.mkdir(parents=True, exist_ok=True)
-            current_datetime = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            soccer_dir = video_dir / f"{self.env_id}__MAPPOSoccer__seed{self.seed}__{current_datetime}"
-            soccer_dir.mkdir(parents=True, exist_ok=True)
-            filename = soccer_dir / f"rl_video_episode_{self.episode_count}.mp4"
-            frames_array = np.array(self.frames)
-            imageio.mimsave(filename, frames_array, fps=FPS)
-            print(f"Recording saved as {filename}")
-            
-            # Clear frames after saving
-            self.frames = []
-        except ImportError:
-            print("Could not save video: imageio and/or numpy not installed")
     
     def close(self):
         """Close the environment"""
